@@ -11,7 +11,6 @@ import urllib.request
 import urllib.parse
 import urllib.error
 import json
-import sqlite3
 import smtplib
 import os
 from email.mime.text import MIMEText
@@ -34,74 +33,73 @@ ASSIGNMENTS = [
     {'label': 'Section 216874', 'course_id': '216874', 'assignment_id': '2624407'},
 ]
 
-DB_PATH = os.environ.get('DB_PATH', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'comments.db'))
+SUPABASE_URL = 'https://gxcyitcuceimpsjpcdma.supabase.co'
+SUPABASE_KEY = os.environ.get('SUPABASE_KEY', 'sb_publishable_uPxVTChmZItCG51gt8Angw_8Ii70pEj')
 
 app = Flask(__name__)
 
-# ── Database ──────────────────────────────────────────────────────────────────
+# ── Database (Supabase REST API) ───────────────────────────────────────────────
 
-def init_db():
-    con = sqlite3.connect(DB_PATH)
-    con.execute('''CREATE TABLE IF NOT EXISTS comments (
-        id            INTEGER PRIMARY KEY AUTOINCREMENT,
-        course_id     TEXT NOT NULL,
-        assignment_id TEXT NOT NULL,
-        student_id    TEXT NOT NULL,
-        author_name   TEXT NOT NULL,
-        author_email  TEXT,
-        body          TEXT NOT NULL,
-        created_at    TEXT NOT NULL
-    )''')
-    con.execute('''CREATE TABLE IF NOT EXISTS ratings (
-        id            INTEGER PRIMARY KEY AUTOINCREMENT,
-        course_id     TEXT NOT NULL,
-        assignment_id TEXT NOT NULL,
-        student_id    TEXT NOT NULL,
-        score         INTEGER NOT NULL CHECK(score BETWEEN 1 AND 10),
-        created_at    TEXT NOT NULL
-    )''')
-    con.commit()
-    con.close()
+def _sb_headers(extra=None):
+    h = {
+        'apikey':        SUPABASE_KEY,
+        'Authorization': 'Bearer ' + SUPABASE_KEY,
+        'Content-Type':  'application/json',
+    }
+    if extra:
+        h.update(extra)
+    return h
+
+def _sb_get(table, params=''):
+    url = f'{SUPABASE_URL}/rest/v1/{table}?{params}'
+    req = urllib.request.Request(url, headers=_sb_headers())
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.loads(r.read())
+
+def _sb_insert(table, data):
+    url  = f'{SUPABASE_URL}/rest/v1/{table}'
+    body = json.dumps(data).encode()
+    req  = urllib.request.Request(url, data=body, method='POST',
+                                   headers=_sb_headers({'Prefer': 'return=minimal'}))
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return r.status
+
+def _sb_delete(table, params):
+    url = f'{SUPABASE_URL}/rest/v1/{table}?{params}'
+    req = urllib.request.Request(url, method='DELETE', headers=_sb_headers())
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return r.status
 
 def db_add_comment(course_id, assignment_id, student_id, author_name, author_email, body):
-    con = sqlite3.connect(DB_PATH)
-    con.execute(
-        'INSERT INTO comments (course_id,assignment_id,student_id,author_name,author_email,body,created_at) VALUES (?,?,?,?,?,?,?)',
-        (course_id, assignment_id, student_id, author_name, author_email, body,
-         time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()))
-    )
-    con.commit()
-    con.close()
+    _sb_insert('comments', {
+        'course_id': course_id, 'assignment_id': assignment_id,
+        'student_id': student_id, 'author_name': author_name,
+        'author_email': author_email, 'body': body,
+        'created_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+    })
 
 def db_add_rating(course_id, assignment_id, student_id, score):
-    con = sqlite3.connect(DB_PATH)
-    con.execute(
-        'INSERT INTO ratings (course_id,assignment_id,student_id,score,created_at) VALUES (?,?,?,?,?)',
-        (course_id, assignment_id, student_id, score,
-         time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()))
-    )
-    con.commit()
-    con.close()
+    _sb_insert('ratings', {
+        'course_id': course_id, 'assignment_id': assignment_id,
+        'student_id': student_id, 'score': score,
+        'created_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+    })
 
 def db_all_comments():
-    con = sqlite3.connect(DB_PATH)
-    con.row_factory = sqlite3.Row
-    rows = con.execute('SELECT * FROM comments ORDER BY created_at ASC').fetchall()
-    con.close()
+    rows = _sb_get('comments', 'select=*&order=created_at.asc')
     result = {}
     for r in rows:
         key = f"{r['course_id']}|{r['assignment_id']}|{r['student_id']}"
-        result.setdefault(key, []).append(dict(r))
+        result.setdefault(key, []).append(r)
     return result
 
 def db_all_ratings():
-    con = sqlite3.connect(DB_PATH)
-    rows = con.execute(
-        'SELECT course_id,assignment_id,student_id,AVG(score),COUNT(*) FROM ratings '
-        'GROUP BY course_id,assignment_id,student_id'
-    ).fetchall()
-    con.close()
-    return {f'{r[0]}|{r[1]}|{r[2]}': {'avg': round(r[3], 1), 'count': r[4]} for r in rows}
+    rows = _sb_get('ratings', 'select=*')
+    agg  = {}
+    for r in rows:
+        key = f"{r['course_id']}|{r['assignment_id']}|{r['student_id']}"
+        agg.setdefault(key, []).append(r['score'])
+    return {k: {'avg': round(sum(v)/len(v), 1), 'count': len(v)} for k, v in agg.items()}
 
 # ── Canvas helpers ─────────────────────────────────────────────────────────────
 
@@ -1025,7 +1023,6 @@ document.addEventListener('keydown', e => {
 
 # ── Startup ────────────────────────────────────────────────────────────────────
 
-init_db()
 threading.Thread(target=keep_alive, daemon=True).start()
 
 if __name__ == '__main__':
