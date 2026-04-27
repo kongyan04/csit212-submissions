@@ -251,13 +251,16 @@ def announce_page():
 
 @app.route('/announce', methods=['POST'])
 def announce_post():
-    d     = request.get_json(force=True)
-    title = str(d.get('title', '')).strip()
-    body  = str(d.get('body',  '')).strip()
+    d          = request.get_json(force=True)
+    title      = str(d.get('title', '')).strip()
+    body       = str(d.get('body',  '')).strip()
+    course_ids = d.get('course_ids') or [a['course_id'] for a in ASSIGNMENTS]
     if not title or not body:
         return jsonify({'ok': False, 'error': 'Title and body are required.'}), 400
     results = []
     for cfg in ASSIGNMENTS:
+        if cfg['course_id'] not in course_ids:
+            continue
         ok, info = canvas_post_announcement(cfg['course_id'], title, body)
         results.append({'label': cfg['label'], 'ok': ok, 'info': info})
     return jsonify({'ok': all(r['ok'] for r in results), 'results': results})
@@ -702,16 +705,16 @@ function renderRows(tbodyId, rows, section) {
       : '<span style="color:#ccc;font-size:0.8rem">No ratings yet</span>';
 
     return `<tr>
-      <td><div class="student-name">${esc(r.name)}</div><div class="student-login">${esc(r.login)}</div></td>
+      <td><div class="student-name">${esc(fmtName(r.name))}</div><div class="student-login">${esc(r.login)}</div></td>
       <td class="link-cell">${linkHtml}</td>
       <td>${pill}</td>
       <td class="rating-cell">
         <div id="${rcid}">${avgStr}</div>
-        <button class="rate-btn" onclick="openRatingModal('${esc(section.course_id)}','${esc(section.assignment_id)}','${esc(r.student_id)}','${esc(r.name)}','${rcid}')">⭐ Rate</button>
+        <button class="rate-btn" onclick="openRatingModal('${esc(section.course_id)}','${esc(section.assignment_id)}','${esc(r.student_id)}','${esc(fmtName(r.name))}','${rcid}')">⭐ Rate</button>
       </td>
       <td class="comment-cell">
         <div class="comment-list">${commentHtml}</div>
-        <button class="add-comment-btn" onclick="openModal('${esc(section.course_id)}','${esc(section.assignment_id)}','${esc(r.student_id)}','${esc(r.name)}','${esc(r.email)}')">
+        <button class="add-comment-btn" onclick="openModal('${esc(section.course_id)}','${esc(section.assignment_id)}','${esc(r.student_id)}','${esc(fmtName(r.name))}','${esc(r.email)}')">
           ${btnLabel}</button>
       </td>
     </tr>`;
@@ -862,6 +865,11 @@ function fmtDate(iso) {
   if (!iso) return '';
   return new Date(iso).toLocaleDateString('en-US',{month:'short',day:'numeric'});
 }
+function fmtName(full) {
+  const parts = String(full).trim().split(/\s+/);
+  if (parts.length < 2) return full;
+  return parts[0][0].toUpperCase() + '. ' + parts.slice(1).join(' ');
+}
 function esc(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
                   .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
@@ -925,17 +933,38 @@ ANNOUNCE_HTML = r'''<!DOCTYPE html>
   .result-label { font-weight: 700; flex: 1; }
   .result-info  { font-size: 0.78rem; color: #888; word-break: break-all; }
   .result-info a { color: #007acc; }
+
+  .section-checks { display: flex; flex-direction: column; gap: 8px; margin: 10px 0 4px; }
+  .check-label { display: flex; align-items: center; gap: 10px; padding: 10px 14px;
+    border: 1px solid #e2e8f0; border-radius: 8px; cursor: pointer; transition: background 0.1s; }
+  .check-label:hover { background: #f0f8ff; }
+  .check-label input[type=checkbox] { width: 16px; height: 16px; accent-color: #007acc; cursor: pointer; }
+  .check-info { display: flex; flex-direction: column; gap: 2px; }
+  .check-info strong { font-size: 0.9rem; color: #222; }
+  .cid { font-size: 0.75rem; color: #aaa; }
 </style>
 </head>
 <body>
 <div class="card">
   <h1>📢 Post Announcement</h1>
-  <p class="subtitle">Posts to all three CSIT 212 sections simultaneously</p>
-  <div class="targets">
-    <span class="tag">Section 212615</span>
-    <span class="tag">Section 212604</span>
-    <span class="tag">Section 216874</span>
+  <p class="subtitle">Select which sections to post to, then write your announcement</p>
+
+  <label style="margin-top:0">Post to Sections *</label>
+  <div class="section-checks">
+    <label class="check-label">
+      <input type="checkbox" name="section" value="212615" checked>
+      <span class="check-info"><strong>CSIT 212-615</strong> <span class="cid">Course ID: 212615</span></span>
+    </label>
+    <label class="check-label">
+      <input type="checkbox" name="section" value="212604" checked>
+      <span class="check-info"><strong>CSIT 212-604</strong> <span class="cid">Course ID: 212604</span></span>
+    </label>
+    <label class="check-label">
+      <input type="checkbox" name="section" value="216874" checked>
+      <span class="check-info"><strong>CSIT 212-874</strong> <span class="cid">Course ID: 216874</span></span>
+    </label>
   </div>
+
   <label>Announcement Title *</label>
   <input type="text" id="title" placeholder="e.g. Final Project Due Date Reminder">
   <label>Message *</label>
@@ -949,8 +978,10 @@ ANNOUNCE_HTML = r'''<!DOCTYPE html>
 </div>
 <script>
 async function postAnnouncement() {
-  const title = document.getElementById('title').value.trim();
-  const body  = document.getElementById('body').value.trim();
+  const title    = document.getElementById('title').value.trim();
+  const body     = document.getElementById('body').value.trim();
+  const selected = [...document.querySelectorAll('input[name=section]:checked')].map(c => c.value);
+  if (!selected.length) { alert('Please select at least one section.'); return; }
   if (!title) { alert('Please enter a title.'); return; }
   if (!body)  { alert('Please write a message.'); return; }
   const btn = document.getElementById('submitBtn');
@@ -958,7 +989,7 @@ async function postAnnouncement() {
   try {
     const res  = await fetch('/announce', {
       method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({title, body})
+      body: JSON.stringify({title, body, course_ids: selected})
     });
     const json = await res.json();
     const el   = document.getElementById('results');
