@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
 Canvas Final Project Submissions Server
-- Fetches submission data from Canvas API every 30 minutes
-- Serves a public read-only + comment page for students
-- Comments are stored locally, posted to Canvas, and emailed to the student
-- Run: python3 canvas_server.py
+- Browser fetches Canvas data via /canvas-proxy/ (server adds auth token)
+- Comments + ratings stored in SQLite, served via /comments
+- Announcements posted to all 3 sections via /announce
 """
 import threading
 import time
@@ -15,22 +14,19 @@ import json
 import sqlite3
 import smtplib
 import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from flask import Flask, jsonify, request, abort
+from flask import Flask, jsonify, request, Response
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-TOKEN        = '1925~QYBVrAy7KvKTHTCM2tG8ZTDQRx4fH2tDBvRE4YkzJxtCTzTyMecvP2YUz33E8ukC'
-CANVAS_BASE  = 'https://montclair.instructure.com'
-REFRESH_INTERVAL = 30 * 60  # 30 minutes
+TOKEN       = '1925~QYBVrAy7KvKTHTCM2tG8ZTDQRx4fH2tDBvRE4YkzJxtCTzTyMecvP2YUz33E8ukC'
+CANVAS_BASE = 'https://montclair.instructure.com'
 
-# Email settings — Montclair Office 365
-SMTP_FROM    = 'kongy@montclair.edu'
-SMTP_HOST    = 'smtp.office365.com'
-SMTP_PORT    = 587
-SMTP_PASS    = os.environ.get('MONTCLAIR_EMAIL_PASSWORD', 'QuFu1234!!')
+SMTP_FROM = 'kongy@montclair.edu'
+SMTP_HOST = 'smtp.office365.com'
+SMTP_PORT = 587
+SMTP_PASS = os.environ.get('MONTCLAIR_EMAIL_PASSWORD', 'QuFu1234!!')
 
 ASSIGNMENTS = [
     {'label': 'Section 212615', 'course_id': '212615', 'assignment_id': '2606377'},
@@ -40,10 +36,6 @@ ASSIGNMENTS = [
 
 DB_PATH = os.environ.get('DB_PATH', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'comments.db'))
 
-# ── Shared cache ───────────────────────────────────────────────────────────────
-cache = {'sections': [], 'last_updated': None, 'loading': False, 'error': None}
-cache_lock = threading.Lock()
-
 app = Flask(__name__)
 
 # ── Database ──────────────────────────────────────────────────────────────────
@@ -51,14 +43,14 @@ app = Flask(__name__)
 def init_db():
     con = sqlite3.connect(DB_PATH)
     con.execute('''CREATE TABLE IF NOT EXISTS comments (
-        id           INTEGER PRIMARY KEY AUTOINCREMENT,
-        course_id    TEXT NOT NULL,
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        course_id     TEXT NOT NULL,
         assignment_id TEXT NOT NULL,
-        student_id   TEXT NOT NULL,
-        author_name  TEXT NOT NULL,
-        author_email TEXT,
-        body         TEXT NOT NULL,
-        created_at   TEXT NOT NULL
+        student_id    TEXT NOT NULL,
+        author_name   TEXT NOT NULL,
+        author_email  TEXT,
+        body          TEXT NOT NULL,
+        created_at    TEXT NOT NULL
     )''')
     con.execute('''CREATE TABLE IF NOT EXISTS ratings (
         id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -71,119 +63,86 @@ def init_db():
     con.commit()
     con.close()
 
+def db_add_comment(course_id, assignment_id, student_id, author_name, author_email, body):
+    con = sqlite3.connect(DB_PATH)
+    con.execute(
+        'INSERT INTO comments (course_id,assignment_id,student_id,author_name,author_email,body,created_at) VALUES (?,?,?,?,?,?,?)',
+        (course_id, assignment_id, student_id, author_name, author_email, body,
+         time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()))
+    )
+    con.commit()
+    con.close()
+
 def db_add_rating(course_id, assignment_id, student_id, score):
     con = sqlite3.connect(DB_PATH)
     con.execute(
-        'INSERT INTO ratings (course_id, assignment_id, student_id, score, created_at) VALUES (?,?,?,?,?)',
+        'INSERT INTO ratings (course_id,assignment_id,student_id,score,created_at) VALUES (?,?,?,?,?)',
         (course_id, assignment_id, student_id, score,
          time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()))
     )
     con.commit()
     con.close()
 
-def db_all_ratings():
-    """Return dict keyed by (course_id, assignment_id, student_id) → {avg, count}."""
-    con = sqlite3.connect(DB_PATH)
-    rows = con.execute(
-        'SELECT course_id, assignment_id, student_id, AVG(score) as avg, COUNT(*) as cnt '
-        'FROM ratings GROUP BY course_id, assignment_id, student_id'
-    ).fetchall()
-    con.close()
-    return {(r[0], r[1], r[2]): {'avg': round(r[3], 1), 'count': r[4]} for r in rows}
-
-def db_add_comment(course_id, assignment_id, student_id, author_name, author_email, body):
-    con = sqlite3.connect(DB_PATH)
-    cur = con.execute(
-        'INSERT INTO comments (course_id, assignment_id, student_id, author_name, author_email, body, created_at) VALUES (?,?,?,?,?,?,?)',
-        (course_id, assignment_id, student_id, author_name, author_email, body,
-         time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()))
-    )
-    con.commit()
-    cid = cur.lastrowid
-    con.close()
-    return cid
-
-def db_get_comments(course_id, assignment_id, student_id):
-    con = sqlite3.connect(DB_PATH)
-    con.row_factory = sqlite3.Row
-    rows = con.execute(
-        'SELECT * FROM comments WHERE course_id=? AND assignment_id=? AND student_id=? ORDER BY created_at ASC',
-        (course_id, assignment_id, student_id)
-    ).fetchall()
-    con.close()
-    return [dict(r) for r in rows]
-
 def db_all_comments():
-    """Return dict keyed by (course_id, assignment_id, student_id) → list of comments."""
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
     rows = con.execute('SELECT * FROM comments ORDER BY created_at ASC').fetchall()
     con.close()
     result = {}
     for r in rows:
-        key = (r['course_id'], r['assignment_id'], str(r['student_id']))
+        key = f"{r['course_id']}|{r['assignment_id']}|{r['student_id']}"
         result.setdefault(key, []).append(dict(r))
     return result
 
+def db_all_ratings():
+    con = sqlite3.connect(DB_PATH)
+    rows = con.execute(
+        'SELECT course_id,assignment_id,student_id,AVG(score),COUNT(*) FROM ratings '
+        'GROUP BY course_id,assignment_id,student_id'
+    ).fetchall()
+    con.close()
+    return {f'{r[0]}|{r[1]}|{r[2]}': {'avg': round(r[3], 1), 'count': r[4]} for r in rows}
+
 # ── Canvas helpers ─────────────────────────────────────────────────────────────
 
-def canvas_get(path):
+def canvas_request(method, path, body=None):
     url = CANVAS_BASE + path
-    req = urllib.request.Request(url, headers={
-        'Authorization': 'Bearer ' + TOKEN,
-        'Accept': 'application/json',
-    })
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        data = json.loads(resp.read())
-        link = resp.headers.get('Link', '')
-        next_url = None
-        for part in link.split(','):
-            if 'rel="next"' in part:
-                next_url = part.split('<')[1].split('>')[0].replace(CANVAS_BASE, '')
-                break
-        return data, next_url
-
-def canvas_get_all(path):
-    results, next_path = [], path
-    while next_path:
-        data, next_path = canvas_get(next_path)
-        results.extend(data if isinstance(data, list) else [data])
-    return results
+    headers = {'Authorization': 'Bearer ' + TOKEN, 'Accept': 'application/json'}
+    req = urllib.request.Request(url, data=body, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return resp.status, resp.read(), resp.headers.get('Link', '')
+    except urllib.error.HTTPError as e:
+        return e.code, e.read(), ''
 
 def canvas_post_comment(course_id, assignment_id, student_id, text):
-    """Post a comment to a Canvas submission."""
-    url = f'{CANVAS_BASE}/api/v1/courses/{course_id}/assignments/{assignment_id}/submissions/{student_id}'
     body = urllib.parse.urlencode({'comment[text_body]': text}).encode()
-    req = urllib.request.Request(url, data=body, method='PUT', headers={
-        'Authorization': 'Bearer ' + TOKEN,
-        'Accept': 'application/json',
-    })
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            return True, None
-    except urllib.error.HTTPError as e:
-        return False, f'Canvas error {e.code}: {e.read().decode()}'
-    except Exception as e:
-        return False, str(e)
+    code, _, __ = canvas_request('PUT',
+        f'/api/v1/courses/{course_id}/assignments/{assignment_id}/submissions/{student_id}', body)
+    return code < 300, f'Canvas error {code}' if code >= 300 else None
+
+def canvas_post_announcement(course_id, title, message):
+    body = urllib.parse.urlencode({
+        'title': title, 'message': message,
+        'is_announcement': 'true', 'published': 'true',
+    }).encode()
+    code, data, _ = canvas_request('POST', f'/api/v1/courses/{course_id}/discussion_topics', body)
+    if code < 300:
+        return True, json.loads(data).get('html_url', '')
+    return False, f'Canvas error {code}: {data.decode()}'
 
 # ── Email helper ───────────────────────────────────────────────────────────────
 
 def send_email(to_addr, student_name, commenter_name, comment_body, project_url):
     if not SMTP_PASS:
-        print(f'[email] Skipped (no SMTP_PASS set). Would email: {to_addr}')
-        return False, 'Email not configured'
+        return False, 'No SMTP password'
     try:
         msg = MIMEMultipart('alternative')
-        msg['Subject'] = f'New comment on your Final Project – CSIT 212'
+        msg['Subject'] = 'New comment on your Final Project – CSIT 212'
         msg['From']    = f'Prof. Kong – CSIT 212 <{SMTP_FROM}>'
         msg['To']      = to_addr
-
-        text = (f'Hi {student_name},\n\n'
-                f'{commenter_name} left a comment on your Final Project:\n\n'
-                f'"{comment_body}"\n\n'
-                f'View all comments: {project_url}\n\n'
-                f'— CSIT 212')
-
+        text = (f'Hi {student_name},\n\n{commenter_name} left a comment on your Final Project:\n\n'
+                f'"{comment_body}"\n\nView: {project_url}\n\n— CSIT 212')
         html = f'''<div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto">
   <div style="background:#007acc;padding:20px 28px;border-radius:8px 8px 0 0">
     <h2 style="color:#fff;margin:0;font-size:1.1rem">New comment on your Final Project</h2>
@@ -191,128 +150,22 @@ def send_email(to_addr, student_name, commenter_name, comment_body, project_url)
   <div style="background:#fff;border:1px solid #e2e8f0;border-top:none;padding:24px 28px;border-radius:0 0 8px 8px">
     <p style="color:#555;margin:0 0 16px">Hi <strong>{student_name}</strong>,</p>
     <p style="color:#555;margin:0 0 16px"><strong>{commenter_name}</strong> left a comment on your Final Project:</p>
-    <blockquote style="border-left:4px solid #007acc;margin:0 0 20px;padding:12px 16px;background:#f0f8ff;border-radius:0 6px 6px 0;color:#333">
+    <blockquote style="border-left:4px solid #007acc;margin:0 0 20px;padding:12px 16px;background:#f0f8ff;color:#333">
       {comment_body}
     </blockquote>
     <a href="{project_url}" style="display:inline-block;background:#007acc;color:#fff;padding:10px 20px;border-radius:6px;text-decoration:none;font-weight:bold">View all comments</a>
   </div>
 </div>'''
-
         msg.attach(MIMEText(text, 'plain'))
-        msg.attach(MIMEText(html,  'html'))
-
+        msg.attach(MIMEText(html, 'html'))
         with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as s:
-            s.ehlo()
-            s.starttls()
+            s.ehlo(); s.starttls()
             s.login(SMTP_FROM, SMTP_PASS)
             s.sendmail(SMTP_FROM, [to_addr], msg.as_string())
-        print(f'[email] Sent to {to_addr}')
         return True, None
     except Exception as e:
-        print(f'[email] Failed: {e}')
+        print(f'[email] {e}')
         return False, str(e)
-
-# ── Data fetcher ───────────────────────────────────────────────────────────────
-
-def fetch_section(cfg):
-    """Fetch one assignment's submissions. Returns section dict."""
-    course_id, assignment_id = cfg['course_id'], cfg['assignment_id']
-    try:
-        assignment = canvas_get_all(f'/api/v1/courses/{course_id}/assignments/{assignment_id}')[0]
-        # include[]=user gives name/login/email directly — no separate users call needed
-        subs = canvas_get_all(
-            f'/api/v1/courses/{course_id}/assignments/{assignment_id}'
-            f'/submissions?per_page=100&include[]=user'
-        )
-        rows = []
-        for sub in subs:
-            student = sub.get('user') or {}
-            uid     = str(sub.get('user_id', ''))
-            links   = []
-            if sub.get('url'):
-                links.append(sub['url'])
-            for att in sub.get('attachments') or []:
-                url = att.get('url', '')
-                # Skip Canvas file-download URLs — only keep external website links
-                if url and 'instructure.com' not in url:
-                    links.append(url)
-            login = student.get('login_id', '')
-            email = student.get('email', '') or (login + '@mail.montclair.edu' if login else '')
-            rows.append({
-                'student_id':      uid,
-                'name':            student.get('name', 'Unknown'),
-                'login':           login,
-                'email':           email,
-                'links':           links,
-                'submitted_at':    sub.get('submitted_at'),
-                'score':           sub.get('score'),
-                'points_possible': assignment.get('points_possible'),
-                'workflow_state':  sub.get('workflow_state'),
-                'late':            sub.get('late', False),
-                'missing':         sub.get('missing', False),
-            })
-        rows.sort(key=lambda r: (0 if r['submitted_at'] else 1, r['name'].lower()))
-        return {
-            'label':         cfg['label'],
-            'course_id':     course_id,
-            'assignment_id': assignment_id,
-            'assign_name':   assignment.get('name', ''),
-            'due_at':        assignment.get('due_at'),
-            'rows':          rows,
-            'submitted':     sum(1 for r in rows if r['submitted_at']),
-            'total':         len(rows),
-        }
-    except Exception as e:
-        return {
-            'label': cfg['label'], 'course_id': course_id,
-            'assignment_id': assignment_id, 'assign_name': '',
-            'due_at': None, 'rows': [], 'submitted': 0, 'total': 0,
-            'fetch_error': str(e),
-        }
-
-def fetch_all_data():
-    """Fetch all sections in parallel."""
-    sections_map = {}
-    with ThreadPoolExecutor(max_workers=3) as ex:
-        futures = {ex.submit(fetch_section, cfg): cfg['label'] for cfg in ASSIGNMENTS}
-        for fut in as_completed(futures):
-            label = futures[fut]
-            sections_map[label] = fut.result()
-    # Return in original order
-    return [sections_map[cfg['label']] for cfg in ASSIGNMENTS]
-
-def do_fetch():
-    """Fetch once, update cache, then schedule next fetch."""
-    print('[canvas] Fetching data from Canvas…')
-    with cache_lock:
-        cache['loading'] = True; cache['error'] = None
-    try:
-        sections = fetch_all_data()
-        with cache_lock:
-            cache['sections']     = sections
-            cache['last_updated'] = time.strftime('%B %d, %Y at %I:%M %p')
-            cache['loading']      = False
-        print(f'[canvas] Done — {sum(s["total"] for s in sections)} submissions loaded.')
-    except Exception as e:
-        with cache_lock:
-            cache['error'] = str(e); cache['loading'] = False
-        print(f'[canvas] Error: {e}')
-    # Schedule next fetch
-    t = threading.Timer(REFRESH_INTERVAL, do_fetch)
-    t.daemon = True
-    t.start()
-
-def trigger_fetch_if_needed():
-    """Start a fetch if cache is empty and not already loading."""
-    with cache_lock:
-        if cache['sections'] or cache['loading']:
-            return
-        cache['loading'] = True
-    print('[canvas] On-demand fetch triggered.')
-    threading.Thread(target=do_fetch, daemon=True).start()
-
-def refresh_loop():
-    do_fetch()
 
 # ── Flask routes ───────────────────────────────────────────────────────────────
 
@@ -320,119 +173,77 @@ def refresh_loop():
 def index():
     return app.response_class(HTML, mimetype='text/html')
 
-@app.route('/data')
-def data():
-    trigger_fetch_if_needed()  # wake up if the background thread was killed during sleep
-    with cache_lock:
-        sections = json.loads(json.dumps(cache['sections']))  # deep copy
-    # Attach comments and ratings
-    all_comments = db_all_comments()
-    all_ratings  = db_all_ratings()
-    for sec in sections:
-        for row in sec.get('rows', []):
-            key = (sec['course_id'], sec['assignment_id'], str(row['student_id']))
-            row['comments'] = all_comments.get(key, [])
-            row['rating']   = all_ratings.get(key, {'avg': None, 'count': 0})
-    with cache_lock:
-        return jsonify({
-            'sections':     sections,
-            'last_updated': cache['last_updated'],
-            'loading':      cache['loading'],
-            'error':        cache['error'],
-        })
+@app.route('/canvas-proxy/<path:canvas_path>')
+def canvas_proxy(canvas_path):
+    """Forward GET requests to Canvas with server-side auth token."""
+    qs   = request.query_string.decode()
+    path = '/' + canvas_path + ('?' + qs if qs else '')
+    code, body, link = canvas_request('GET', path)
+    # Rewrite pagination links to go through proxy
+    if link:
+        link = link.replace(CANVAS_BASE, request.host_url.rstrip('/') + '/canvas-proxy')
+    resp = Response(body, status=code, mimetype='application/json')
+    resp.headers['Access-Control-Allow-Origin'] = '*'
+    if link:
+        resp.headers['Link'] = link
+    return resp
 
-@app.route('/rate', methods=['POST'])
-def post_rating():
-    d = request.get_json(force=True)
-    course_id     = str(d.get('course_id', '')).strip()
-    assignment_id = str(d.get('assignment_id', '')).strip()
-    student_id    = str(d.get('student_id', '')).strip()
-    score         = d.get('score')
-
-    if not all([course_id, assignment_id, student_id]):
-        return jsonify({'ok': False, 'error': 'Missing fields'}), 400
-    try:
-        score = int(score)
-        assert 1 <= score <= 10
-    except Exception:
-        return jsonify({'ok': False, 'error': 'Score must be 1–10'}), 400
-
-    known = {(a['course_id'], a['assignment_id']) for a in ASSIGNMENTS}
-    if (course_id, assignment_id) not in known:
-        return jsonify({'ok': False, 'error': 'Unknown assignment'}), 403
-
-    db_add_rating(course_id, assignment_id, student_id, score)
-    rating = db_all_ratings().get((course_id, assignment_id, student_id), {'avg': score, 'count': 1})
-    return jsonify({'ok': True, 'rating': rating})
+@app.route('/comments')
+def get_comments():
+    return jsonify({'comments': db_all_comments(), 'ratings': db_all_ratings()})
 
 @app.route('/comment', methods=['POST'])
 def post_comment():
-    d = request.get_json(force=True)
-    course_id     = str(d.get('course_id', '')).strip()
+    d             = request.get_json(force=True)
+    course_id     = str(d.get('course_id',     '')).strip()
     assignment_id = str(d.get('assignment_id', '')).strip()
-    student_id    = str(d.get('student_id', '')).strip()
-    author_name   = str(d.get('author_name', '')).strip()[:100]
-    author_email  = str(d.get('author_email', '')).strip()[:200]
-    body          = str(d.get('body', '')).strip()[:2000]
+    student_id    = str(d.get('student_id',    '')).strip()
+    author_name   = str(d.get('author_name',   '')).strip()[:100]
+    author_email  = str(d.get('author_email',  '')).strip()[:200]
+    body          = str(d.get('body',          '')).strip()[:2000]
+    student_name  = str(d.get('student_name',  'Student')).strip()
+    student_email = str(d.get('student_email', '')).strip()
 
     if not all([course_id, assignment_id, student_id, author_name, body]):
         return jsonify({'ok': False, 'error': 'Missing fields'}), 400
-
-    # Validate against known assignments
     known = {(a['course_id'], a['assignment_id']) for a in ASSIGNMENTS}
     if (course_id, assignment_id) not in known:
         return jsonify({'ok': False, 'error': 'Unknown assignment'}), 403
 
-    # Find student info from cache
-    student_name  = 'Student'
-    student_email = ''
-    with cache_lock:
-        for sec in cache['sections']:
-            if sec['course_id'] == course_id and sec['assignment_id'] == assignment_id:
-                for row in sec['rows']:
-                    if str(row['student_id']) == student_id:
-                        student_name  = row['name']
-                        student_email = row['email']
-                        break
-
-    # 1. Save locally
     db_add_comment(course_id, assignment_id, student_id, author_name, author_email, body)
 
-    # 2. Post to Canvas
     canvas_text = f'[Peer comment from {author_name}]: {body}'
     canvas_ok, canvas_err = canvas_post_comment(course_id, assignment_id, student_id, canvas_text)
     if not canvas_ok:
         print(f'[canvas comment] {canvas_err}')
 
-    # 3. Send email to student
     if student_email:
-        base_url = request.host_url.rstrip('/')
-        send_email(student_email, student_name, author_name, body, base_url)
+        send_email(student_email, student_name, author_name, body,
+                   request.host_url.rstrip('/'))
 
     return jsonify({'ok': True, 'canvas_ok': canvas_ok})
 
-# ── Announcements ─────────────────────────────────────────────────────────────
-
-def canvas_post_announcement(course_id, title, message):
-    """Post an announcement to a Canvas course."""
-    url  = f'{CANVAS_BASE}/api/v1/courses/{course_id}/discussion_topics'
-    body = urllib.parse.urlencode({
-        'title':           title,
-        'message':         message,
-        'is_announcement': 'true',
-        'published':       'true',
-    }).encode()
-    req = urllib.request.Request(url, data=body, method='POST', headers={
-        'Authorization': 'Bearer ' + TOKEN,
-        'Accept':        'application/json',
-    })
+@app.route('/rate', methods=['POST'])
+def post_rating():
+    d             = request.get_json(force=True)
+    course_id     = str(d.get('course_id',     '')).strip()
+    assignment_id = str(d.get('assignment_id', '')).strip()
+    student_id    = str(d.get('student_id',    '')).strip()
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            return True, json.loads(resp.read()).get('html_url', '')
-    except urllib.error.HTTPError as e:
-        return False, f'Canvas error {e.code}: {e.read().decode()}'
-    except Exception as e:
-        return False, str(e)
+        score = int(d.get('score'))
+        assert 1 <= score <= 10
+    except Exception:
+        return jsonify({'ok': False, 'error': 'Score must be 1–10'}), 400
+    known = {(a['course_id'], a['assignment_id']) for a in ASSIGNMENTS}
+    if (course_id, assignment_id) not in known:
+        return jsonify({'ok': False, 'error': 'Unknown assignment'}), 403
+
+    db_add_rating(course_id, assignment_id, student_id, score)
+    key    = f'{course_id}|{assignment_id}|{student_id}'
+    rating = db_all_ratings().get(key, {'avg': score, 'count': 1})
+    return jsonify({'ok': True, 'rating': rating})
+
+# ── Announcements ──────────────────────────────────────────────────────────────
 
 @app.route('/announce')
 def announce_page():
@@ -445,13 +256,23 @@ def announce_post():
     body  = str(d.get('body',  '')).strip()
     if not title or not body:
         return jsonify({'ok': False, 'error': 'Title and body are required.'}), 400
-
     results = []
     for cfg in ASSIGNMENTS:
         ok, info = canvas_post_announcement(cfg['course_id'], title, body)
         results.append({'label': cfg['label'], 'ok': ok, 'info': info})
-    all_ok = all(r['ok'] for r in results)
-    return jsonify({'ok': all_ok, 'results': results})
+    return jsonify({'ok': all(r['ok'] for r in results), 'results': results})
+
+# ── Keep-alive (prevent Render free tier sleep) ────────────────────────────────
+
+def keep_alive():
+    time.sleep(60)
+    while True:
+        try:
+            urllib.request.urlopen('https://csit212-submissions.onrender.com/', timeout=10)
+            print('[keepalive] pinged self')
+        except Exception as e:
+            print(f'[keepalive] {e}')
+        time.sleep(10 * 60)
 
 # ── HTML template ──────────────────────────────────────────────────────────────
 
@@ -513,9 +334,6 @@ HTML = r'''<!DOCTYPE html>
   .link-cell a:hover { text-decoration: underline; }
   .no-link { color: #ccc; font-style: italic; font-size: 0.82rem; }
 
-  .date-cell { font-size: 0.8rem; color: #777; white-space: nowrap; }
-  .score-cell { font-weight: 700; }
-
   .pill { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 0.72rem; font-weight: 700; }
   .pill-green { background: #c6f6d5; color: #276749; }
   .pill-blue  { background: #bee3f8; color: #2a69ac; }
@@ -530,13 +348,19 @@ HTML = r'''<!DOCTYPE html>
   .comment-author { font-weight: 700; color: #2b6cb0; }
   .comment-time   { font-size: 0.72rem; color: #aaa; margin-left: 6px; }
   .comment-body   { color: #444; margin-top: 3px; line-height: 1.4; }
-
   .add-comment-btn { background: none; border: 1px dashed #007acc; color: #007acc;
     border-radius: 6px; padding: 4px 10px; font-size: 0.78rem; cursor: pointer;
     transition: all 0.15s; white-space: nowrap; }
   .add-comment-btn:hover { background: #007acc; color: #fff; }
 
-  /* Modal */
+  /* Rating */
+  .rating-cell { min-width: 120px; }
+  .rate-btn { background: none; border: 1px dashed #f6ad55; color: #c07a00;
+    border-radius: 6px; padding: 4px 10px; font-size: 0.78rem; cursor: pointer;
+    transition: all 0.15s; white-space: nowrap; margin-top: 5px; display: inline-block; }
+  .rate-btn:hover { background: #f6ad55; color: #fff; }
+
+  /* Modal shared */
   .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.45);
     display: flex; align-items: center; justify-content: center; z-index: 1000;
     opacity: 0; pointer-events: none; transition: opacity 0.15s; }
@@ -549,9 +373,8 @@ HTML = r'''<!DOCTYPE html>
   .modal .target-name { font-size: 0.82rem; color: #888; margin-bottom: 18px; }
   .modal label { font-size: 0.78rem; font-weight: 700; color: #555;
     text-transform: uppercase; letter-spacing: 0.07em; display: block; margin-bottom: 4px; margin-top: 14px; }
-  .modal input, .modal textarea {
-    width: 100%; padding: 9px 12px; border: 1px solid #ccc; border-radius: 8px;
-    font-size: 0.9rem; font-family: inherit; outline: none; resize: vertical; }
+  .modal input, .modal textarea { width: 100%; padding: 9px 12px; border: 1px solid #ccc;
+    border-radius: 8px; font-size: 0.9rem; font-family: inherit; outline: none; resize: vertical; }
   .modal input:focus, .modal textarea:focus { border-color: #007acc; box-shadow: 0 0 0 2px rgba(0,122,204,0.15); }
   .modal textarea { min-height: 100px; }
   .modal-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 20px; }
@@ -562,17 +385,9 @@ HTML = r'''<!DOCTYPE html>
   .btn-primary:disabled { background: #a0c8e8; cursor: not-allowed; }
   .btn-secondary { background: #eee; color: #555; }
   .btn-secondary:hover { background: #ddd; }
-
-  .modal-error { color: #c53030; font-size: 0.82rem; margin-top: 10px; }
+  .modal-error   { color: #c53030; font-size: 0.82rem; margin-top: 10px; }
   .modal-success { color: #276749; font-size: 0.82rem; margin-top: 10px; background: #c6f6d5;
     border-radius: 6px; padding: 8px 12px; }
-
-  /* Rating */
-  .rating-cell { min-width: 120px; }
-  .rate-btn { background: none; border: 1px dashed #f6ad55; color: #c07a00;
-    border-radius: 6px; padding: 4px 10px; font-size: 0.78rem; cursor: pointer;
-    transition: all 0.15s; white-space: nowrap; margin-top: 5px; display: inline-block; }
-  .rate-btn:hover { background: #f6ad55; color: #fff; }
 
   /* Rating modal stars */
   .rating-stars-row { display: flex; gap: 6px; justify-content: center; flex-wrap: wrap; margin: 18px 0 8px; }
@@ -597,7 +412,7 @@ HTML = r'''<!DOCTYPE html>
 </header>
 
 <div class="meta-bar">
-  <span><span class="dot" id="statusDot"></span>&nbsp;<span id="statusText">Loading…</span></span>
+  <span><span class="dot loading" id="statusDot"></span>&nbsp;<span id="statusText">Loading…</span></span>
   <span id="lastUpdated"></span>
   <span class="countdown" id="countdown"></span>
 </div>
@@ -617,7 +432,7 @@ HTML = r'''<!DOCTYPE html>
     <input type="email" id="modalAuthorEmail" placeholder="your@email.com">
     <label>Comment *</label>
     <textarea id="modalBody" placeholder="Write your feedback or comment…"></textarea>
-    <div class="modal-error"   id="modalError"  style="display:none"></div>
+    <div class="modal-error"   id="modalError"   style="display:none"></div>
     <div class="modal-success" id="modalSuccess" style="display:none"></div>
     <div class="modal-actions">
       <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
@@ -643,42 +458,114 @@ HTML = r'''<!DOCTYPE html>
 </div>
 
 <script>
-let allData   = null;
-let sortState = {};
-let modalCtx  = null;   // { courseId, assignmentId, studentId, studentName }
-let ratingCtx = null;   // { courseId, assignmentId, studentId, studentName, score }
+const ASSIGNMENTS = ''' + json.dumps(ASSIGNMENTS) + r''';
+let allSections = [];   // [{label,course_id,assignment_id,assign_name,due_at,rows}]
+let commentsMap = {};   // "cid|aid|sid" -> [comments]
+let ratingsMap  = {};   // "cid|aid|sid" -> {avg,count}
+let sortState   = {};
+let modalCtx    = null;
+let ratingCtx   = null;
 
-// ── Data loading ──────────────────────────────────────────────────────────────
+// ── Bootstrap ─────────────────────────────────────────────────────────────────
 
-async function loadData() {
+async function loadAll() {
+  document.getElementById('statusDot').className    = 'dot loading';
+  document.getElementById('statusText').textContent = 'Loading submissions…';
   try {
-    const res  = await fetch('/data');
-    const json = await res.json();
+    // Fetch Canvas data for all 3 assignments via server proxy (parallel)
+    const sectionPromises = ASSIGNMENTS.map(a => fetchSection(a));
+    const commentsProm    = fetch('/comments').then(r => r.json());
 
-    if (json.loading && !json.sections.length) {
-      // Server is still fetching from Canvas — show spinner and poll again
-      document.getElementById('statusDot').className = 'dot loading';
-      document.getElementById('statusText').textContent = 'Loading submissions from Canvas…';
-      document.getElementById('main').innerHTML =
-        '<div class="loading-state"><div class="spinner"></div>Fetching submissions from Canvas, please wait…</div>';
-      setTimeout(loadData, 5000);
-      return;
-    }
+    allSections = await Promise.all(sectionPromises);
+    const cd    = await commentsProm;
+    commentsMap = cd.comments || {};
+    ratingsMap  = cd.ratings  || {};
 
-    document.getElementById('statusDot').className = 'dot';
+    document.getElementById('statusDot').className    = 'dot';
     document.getElementById('statusText').textContent = 'Live';
     document.getElementById('lastUpdated').textContent =
-      json.last_updated ? 'Updated ' + json.last_updated : '';
-    allData = json.sections;
+      'Updated ' + new Date().toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit'});
+
     renderAll();
-    clearTimeout(window._refreshTimer);
-    window._refreshTimer = setTimeout(loadData, 30 * 60 * 1000);
+    setTimeout(loadAll, 30 * 60 * 1000);
     startCountdown(30 * 60);
   } catch(e) {
     document.getElementById('statusText').textContent = 'Error: ' + e.message;
-    document.getElementById('statusDot').className = 'dot loading';
-    setTimeout(loadData, 15000);
+    document.getElementById('statusDot').className    = 'dot loading';
+    setTimeout(loadAll, 20000);
   }
+}
+
+async function fetchSection(cfg) {
+  // 1) Get assignment info
+  const asgn = await proxyGet(
+    `/api/v1/courses/${cfg.course_id}/assignments/${cfg.assignment_id}`);
+
+  // 2) Get all submissions (paginated)
+  const subs = await proxyGetAll(
+    `/api/v1/courses/${cfg.course_id}/assignments/${cfg.assignment_id}/submissions?per_page=100&include[]=user`);
+
+  const rows = subs.map(sub => {
+    const student = sub.user || {};
+    const links   = [];
+    if (sub.url) links.push(sub.url);
+    (sub.attachments || []).forEach(att => {
+      if (att.url && !att.url.includes('instructure.com')) links.push(att.url);
+    });
+    const login = student.login_id || '';
+    return {
+      student_id:     String(sub.user_id || ''),
+      name:           student.name  || 'Unknown',
+      login:          login,
+      email:          student.email || (login ? login + '@mail.montclair.edu' : ''),
+      links,
+      submitted_at:   sub.submitted_at,
+      workflow_state: sub.workflow_state,
+      late:           sub.late    || false,
+      missing:        sub.missing || false,
+    };
+  });
+
+  rows.sort((a,b) => {
+    if (!!a.submitted_at !== !!b.submitted_at) return a.submitted_at ? -1 : 1;
+    return a.name.localeCompare(b.name);
+  });
+
+  return {
+    label:         cfg.label,
+    course_id:     cfg.course_id,
+    assignment_id: cfg.assignment_id,
+    assign_name:   asgn.name || '',
+    due_at:        asgn.due_at,
+    rows,
+    submitted:     rows.filter(r => r.submitted_at).length,
+    total:         rows.length,
+  };
+}
+
+async function proxyGet(path) {
+  const res = await fetch('/canvas-proxy' + path);
+  if (!res.ok) throw new Error('Canvas proxy error ' + res.status);
+  return res.json();
+}
+
+async function proxyGetAll(path) {
+  let results = [], nextPath = path;
+  while (nextPath) {
+    const res  = await fetch('/canvas-proxy' + nextPath);
+    if (!res.ok) throw new Error('Canvas proxy error ' + res.status);
+    const data = await res.json();
+    results    = results.concat(Array.isArray(data) ? data : [data]);
+    const link = res.headers.get('Link') || '';
+    const m    = link.match(/<([^>]+)>;[^,]*rel="next"/);
+    if (m) {
+      // Strip the host/proxy prefix to get just the path
+      nextPath = m[1].replace(/^https?:\/\/[^/]+\/canvas-proxy/, '');
+    } else {
+      nextPath = null;
+    }
+  }
+  return results;
 }
 
 function startCountdown(seconds) {
@@ -686,46 +573,33 @@ function startCountdown(seconds) {
   let s = seconds;
   const el = document.getElementById('countdown');
   window._cdTimer = setInterval(() => {
-    if (s <= 0) { clearInterval(window._cdTimer); return; }
+    if (--s <= 0) { clearInterval(window._cdTimer); return; }
     const m = Math.floor(s/60), sec = s%60;
     el.textContent = `Refreshes in ${m}:${String(sec).padStart(2,'0')}`;
-    s--;
   }, 1000);
 }
 
 // ── Rendering ─────────────────────────────────────────────────────────────────
 
 function renderAll() {
-  console.log('renderAll: allData length =', (allData||[]).length);
   const main = document.getElementById('main');
   main.innerHTML = '';
-  (allData || []).forEach((s, i) => {
-    console.log('rendering section', i, s.label);
-    try { renderSection(s); } catch(e) { console.error('renderSection error:', e); main.innerHTML += '<p style="color:red">Section error: ' + e.message + '</p>'; }
-  });
+  allSections.forEach(s => renderSection(s));
 }
 
 function renderSection(section) {
   const main = document.getElementById('main');
-  if (!sortState[section.label]) sortState[section.label] = { col: -1, asc: true };
+  if (!sortState[section.label]) sortState[section.label] = {col:-1, asc:true};
   const id  = 'sec-' + section.label.replace(/\s+/g,'_');
   const due = section.due_at
     ? 'Due ' + new Date(section.due_at).toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'}) : '';
 
   const div = document.createElement('div');
   div.id = id;
-
-  if (section.fetch_error) {
-    div.innerHTML = `<div class="section-header"><div class="section-title">${esc(section.label)}</div></div>
-      <div style="color:#c53030;background:#fff5f5;border-radius:8px;padding:12px 16px;font-size:.875rem">
-        Could not load: ${esc(section.fetch_error)}</div>`;
-    main.appendChild(div); return;
-  }
-
   div.innerHTML = `
     <div class="section-header">
       <div class="section-title">${esc(section.label)} &nbsp;&ndash;&nbsp; ${esc(section.assign_name)}</div>
-      <div class="section-meta">${section.submitted} submitted &nbsp;/&nbsp; ${section.total} students${due ? ' &nbsp; ' + due : ''}</div>
+      <div class="section-meta">${section.submitted} submitted &nbsp;/&nbsp; ${section.total} students${due?' &nbsp; '+due:''}</div>
     </div>
     <div class="toolbar">
       <input type="text" id="search-${id}" placeholder="Search student…" oninput="filter('${id}','${section.label}')">
@@ -752,51 +626,43 @@ function renderSection(section) {
   filter(id, section.label);
 }
 
-function getSection(label) { return (allData || []).find(s => s.label === label); }
+function getSection(label) { return allSections.find(s => s.label === label); }
 
 function filter(id, label) {
   const sec    = getSection(label); if (!sec) return;
   const search = (document.getElementById('search-' + id)?.value || '').toLowerCase();
   const status = document.getElementById('status-' + id)?.value || '';
-
   let rows = sec.rows.filter(r => {
-    if (search && !r.name.toLowerCase().includes(search) &&
-                  !r.login.toLowerCase().includes(search)) return false;
+    if (search && !r.name.toLowerCase().includes(search) && !r.login.toLowerCase().includes(search)) return false;
     if (status === 'submitted'   && !r.submitted_at) return false;
     if (status === 'unsubmitted' && r.workflow_state !== 'unsubmitted') return false;
     if (status === 'graded'      && r.workflow_state !== 'graded') return false;
     if (status === 'late'        && !r.late) return false;
     return true;
   });
-
   const st = sortState[label];
   if (st && st.col >= 0) rows = doSort(rows, st.col, st.asc);
-
-  document.getElementById('count-' + id).textContent =
-    rows.length + ' student' + (rows.length !== 1 ? 's' : '');
-  renderRows('tbody-' + id, rows, sec);
+  document.getElementById('count-'+id).textContent = rows.length + ' student' + (rows.length!==1?'s':'');
+  renderRows('tbody-'+id, rows, sec);
 }
 
 function sortSec(id, label, col) {
   const st = sortState[label];
   if (st.col === col) st.asc = !st.asc; else { st.col = col; st.asc = true; }
-  document.querySelectorAll('#' + id + ' thead th').forEach((th,i) => {
+  document.querySelectorAll('#'+id+' thead th').forEach(th => {
     th.classList.remove('sorted');
     const si = th.querySelector('.si'); if (si) si.textContent = '↕';
   });
-  const ths = document.querySelectorAll('#' + id + ' thead th');
-  if (ths[col]) { ths[col].classList.add('sorted'); const si = ths[col].querySelector('.si'); if (si) si.textContent = st.asc ? '↑' : '↓'; }
+  const ths = document.querySelectorAll('#'+id+' thead th');
+  if (ths[col]) { ths[col].classList.add('sorted'); const si = ths[col].querySelector('.si'); if(si) si.textContent = st.asc?'↑':'↓'; }
   filter(id, label);
 }
 
 function doSort(rows, col, asc) {
   return [...rows].sort((a,b) => {
     let va, vb;
-    if      (col===0) { va=a.name; vb=b.name; }
-    else if (col===2) { va=a.submitted_at||''; vb=b.submitted_at||''; }
-    else if (col===3) { va=a.score??-1; vb=b.score??-1; }
-    else return 0;
-    return va<vb ? (asc?-1:1) : va>vb ? (asc?1:-1) : 0;
+    if (col===0) { va=a.name; vb=b.name; } else return 0;
+    return va<vb?(asc?-1:1):va>vb?(asc?1:-1):0;
   });
 }
 
@@ -810,19 +676,18 @@ function renderRows(tbodyId, rows, section) {
       ? r.links.map(l => `<a href="${ea(l)}" target="_blank" rel="noopener">${esc(l)}</a>`).join('')
       : '<span class="no-link">—</span>';
 
-    const dateStr = r.submitted_at
-      ? new Date(r.submitted_at).toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'}) : '—';
-    const scoreStr = r.score != null
-      ? r.score + (r.points_possible ? ' / ' + r.points_possible : '') : '—';
-
     let pill = '';
-    if      (r.missing)                       pill='<span class="pill pill-red">Missing</span>';
-    else if (r.late)                          pill='<span class="pill pill-red">Late</span>';
-    else if (r.workflow_state==='graded')     pill='<span class="pill pill-green">Graded</span>';
-    else if (r.workflow_state==='submitted')  pill='<span class="pill pill-blue">Submitted</span>';
-    else                                      pill='<span class="pill pill-gray">Not Submitted</span>';
+    if      (r.missing)                      pill='<span class="pill pill-red">Missing</span>';
+    else if (r.late)                         pill='<span class="pill pill-red">Late</span>';
+    else if (r.workflow_state==='graded')    pill='<span class="pill pill-green">Graded</span>';
+    else if (r.workflow_state==='submitted') pill='<span class="pill pill-blue">Submitted</span>';
+    else                                     pill='<span class="pill pill-gray">Not Submitted</span>';
 
-    const comments   = r.comments || [];
+    const key      = `${section.course_id}|${section.assignment_id}|${r.student_id}`;
+    const comments = commentsMap[key] || [];
+    const rating   = ratingsMap[key]  || {avg: null, count: 0};
+    const rcid     = 'rc-' + section.course_id + '-' + r.student_id;
+
     const commentHtml = comments.map(c => `
       <div class="comment-item">
         <span class="comment-author">${esc(c.author_name)}</span>
@@ -830,12 +695,8 @@ function renderRows(tbodyId, rows, section) {
         <div class="comment-body">${esc(c.body)}</div>
       </div>`).join('');
 
-    const btnLabel = comments.length
-      ? `💬 ${comments.length} comment${comments.length>1?'s':''}`
-      : '+ Add comment';
+    const btnLabel = comments.length ? `💬 ${comments.length} comment${comments.length>1?'s':''}` : '+ Add comment';
 
-    const rating = r.rating || {avg: null, count: 0};
-    const ratingCid = 'rc-' + esc(section.course_id) + '-' + esc(r.student_id);
     const avgStr = rating.avg != null
       ? `<span style="font-size:1.1rem;font-weight:800;color:#007acc">${rating.avg}</span><span style="font-size:0.75rem;color:#aaa">/10</span> <span style="font-size:0.72rem;color:#bbb">(${rating.count} vote${rating.count!==1?'s':''})</span>`
       : '<span style="color:#ccc;font-size:0.8rem">No ratings yet</span>';
@@ -845,28 +706,30 @@ function renderRows(tbodyId, rows, section) {
       <td class="link-cell">${linkHtml}</td>
       <td>${pill}</td>
       <td class="rating-cell">
-        <div id="${ratingCid}">${avgStr}</div>
-        <button class="rate-btn" onclick="openRatingModal('${esc(section.course_id)}','${esc(section.assignment_id)}','${esc(r.student_id)}','${esc(r.name)}','${ratingCid}')">⭐ Rate</button>
+        <div id="${rcid}">${avgStr}</div>
+        <button class="rate-btn" onclick="openRatingModal('${esc(section.course_id)}','${esc(section.assignment_id)}','${esc(r.student_id)}','${esc(r.name)}','${rcid}')">⭐ Rate</button>
       </td>
       <td class="comment-cell">
         <div class="comment-list">${commentHtml}</div>
-        <button class="add-comment-btn" onclick="openModal('${esc(section.course_id)}','${esc(section.assignment_id)}','${esc(r.student_id)}','${esc(r.name)}')">${btnLabel}</button>
+        <button class="add-comment-btn" onclick="openModal('${esc(section.course_id)}','${esc(section.assignment_id)}','${esc(r.student_id)}','${esc(r.name)}','${esc(r.email)}')">
+          ${btnLabel}</button>
       </td>
     </tr>`;
   }).join('');
 }
 
-// ── Modal ─────────────────────────────────────────────────────────────────────
+// ── Comment Modal ─────────────────────────────────────────────────────────────
 
-function openModal(courseId, assignmentId, studentId, studentName) {
-  modalCtx = { courseId, assignmentId, studentId, studentName };
+function openModal(courseId, assignmentId, studentId, studentName, studentEmail) {
+  modalCtx = {courseId, assignmentId, studentId, studentName, studentEmail};
   document.getElementById('modalTargetName').textContent = "On: " + studentName + "'s project";
   document.getElementById('modalAuthorName').value  = '';
   document.getElementById('modalAuthorEmail').value = '';
   document.getElementById('modalBody').value        = '';
   document.getElementById('modalError').style.display   = 'none';
   document.getElementById('modalSuccess').style.display = 'none';
-  document.getElementById('modalSubmitBtn').disabled = false;
+  document.getElementById('modalSubmitBtn').disabled    = false;
+  document.getElementById('modalSubmitBtn').textContent = 'Post Comment';
   document.getElementById('modalBackdrop').classList.add('open');
   setTimeout(() => document.getElementById('modalAuthorName').focus(), 50);
 }
@@ -881,38 +744,35 @@ async function submitComment() {
   const authorName  = document.getElementById('modalAuthorName').value.trim();
   const authorEmail = document.getElementById('modalAuthorEmail').value.trim();
   const body        = document.getElementById('modalBody').value.trim();
-  const errEl       = document.getElementById('modalError');
-  const okEl        = document.getElementById('modalSuccess');
-
-  errEl.style.display = 'none';
-  okEl.style.display  = 'none';
-
-  if (!authorName) { errEl.textContent = 'Please enter your name.'; errEl.style.display='block'; return; }
-  if (!body)       { errEl.textContent = 'Please write a comment.';  errEl.style.display='block'; return; }
-
+  const errEl = document.getElementById('modalError');
+  const okEl  = document.getElementById('modalSuccess');
+  errEl.style.display = 'none'; okEl.style.display = 'none';
+  if (!authorName) { errEl.textContent='Please enter your name.'; errEl.style.display='block'; return; }
+  if (!body)       { errEl.textContent='Please write a comment.'; errEl.style.display='block'; return; }
   const btn = document.getElementById('modalSubmitBtn');
   btn.disabled = true; btn.textContent = 'Posting…';
-
   try {
-    const res = await fetch('/comment', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+    const res  = await fetch('/comment', {
+      method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({
         course_id: modalCtx.courseId, assignment_id: modalCtx.assignmentId,
         student_id: modalCtx.studentId, author_name: authorName,
         author_email: authorEmail, body,
+        student_name: modalCtx.studentName, student_email: modalCtx.studentEmail,
       })
     });
     const json = await res.json();
     if (json.ok) {
+      const key = `${modalCtx.courseId}|${modalCtx.assignmentId}|${modalCtx.studentId}`;
+      commentsMap[key] = commentsMap[key] || [];
+      commentsMap[key].push({author_name: authorName, body, created_at: new Date().toISOString()});
       okEl.textContent = '✓ Comment posted' + (json.canvas_ok ? ' and added to Canvas.' : '.');
       okEl.style.display = 'block';
       btn.textContent = 'Posted!';
-      // Refresh data to show new comment
       setTimeout(() => {
         document.getElementById('modalBackdrop').classList.remove('open');
-        loadData();
-      }, 1500);
+        renderAll();
+      }, 1400);
     } else {
       errEl.textContent = json.error || 'Failed to post.';
       errEl.style.display = 'block';
@@ -928,28 +788,25 @@ async function submitComment() {
 // ── Rating Modal ──────────────────────────────────────────────────────────────
 
 function openRatingModal(courseId, assignmentId, studentId, studentName, cid) {
-  ratingCtx = { courseId, assignmentId, studentId, studentName, cid, score: null };
+  ratingCtx = {courseId, assignmentId, studentId, studentName, cid, score: null};
   document.getElementById('ratingTargetName').textContent = studentName + "'s project";
   document.getElementById('ratingError').style.display   = 'none';
   document.getElementById('ratingSuccess').style.display = 'none';
   document.getElementById('ratingSubmitBtn').disabled    = false;
   document.getElementById('ratingSubmitBtn').textContent = 'Submit Rating';
-
-  // Build number buttons 1–10
   const row = document.getElementById('ratingStarsRow');
   row.innerHTML = [1,2,3,4,5,6,7,8,9,10].map(n =>
     `<button class="rstar" id="rstar${n}" onclick="selectStar(${n})">${n}</button>`
   ).join('');
-
   document.getElementById('ratingBackdrop').classList.add('open');
 }
 
 function selectStar(n) {
   if (!ratingCtx) return;
   ratingCtx.score = n;
-  for (let i = 1; i <= 10; i++) {
-    const el = document.getElementById('rstar' + i);
-    if (el) el.classList.toggle('selected', i <= n);
+  for (let i=1;i<=10;i++) {
+    const el = document.getElementById('rstar'+i);
+    if (el) el.classList.toggle('selected', i<=n);
   }
 }
 
@@ -962,21 +819,13 @@ async function submitRating() {
   if (!ratingCtx) return;
   const errEl = document.getElementById('ratingError');
   const okEl  = document.getElementById('ratingSuccess');
-  errEl.style.display = 'none';
-  okEl.style.display  = 'none';
-
-  if (!ratingCtx.score) {
-    errEl.textContent = 'Please select a rating first.';
-    errEl.style.display = 'block'; return;
-  }
-
+  errEl.style.display = 'none'; okEl.style.display = 'none';
+  if (!ratingCtx.score) { errEl.textContent='Please select a rating first.'; errEl.style.display='block'; return; }
   const btn = document.getElementById('ratingSubmitBtn');
   btn.disabled = true; btn.textContent = 'Submitting…';
-
   try {
     const res  = await fetch('/rate', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
+      method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({
         course_id: ratingCtx.courseId, assignment_id: ratingCtx.assignmentId,
         student_id: ratingCtx.studentId, score: ratingCtx.score
@@ -985,6 +834,8 @@ async function submitRating() {
     const json = await res.json();
     if (json.ok) {
       const r = json.rating;
+      const key = `${ratingCtx.courseId}|${ratingCtx.assignmentId}|${ratingCtx.studentId}`;
+      ratingsMap[key] = r;
       const avgEl = document.getElementById(ratingCtx.cid);
       if (avgEl) avgEl.innerHTML =
         `<span style="font-size:1.1rem;font-weight:800;color:#007acc">${r.avg}</span>`+
@@ -1006,14 +857,6 @@ async function submitRating() {
   }
 }
 
-// Close modals on Escape
-document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') {
-    document.getElementById('modalBackdrop').classList.remove('open');
-    document.getElementById('ratingBackdrop').classList.remove('open');
-  }
-});
-
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function fmtDate(iso) {
   if (!iso) return '';
@@ -1025,22 +868,18 @@ function esc(s) {
 }
 function ea(s) { return esc(s); }
 
-loadData();
+// Close modals on Escape
+document.addEventListener('keydown', e => {
+  if (e.key==='Escape') {
+    document.getElementById('modalBackdrop').classList.remove('open');
+    document.getElementById('ratingBackdrop').classList.remove('open');
+  }
+});
+
+loadAll();
 </script>
 </body>
 </html>'''
-
-
-def keep_alive():
-    """Ping self every 10 minutes so Render free tier never sleeps."""
-    time.sleep(60)  # wait for server to fully start first
-    while True:
-        try:
-            urllib.request.urlopen('https://csit212-submissions.onrender.com/data', timeout=15)
-            print('[keepalive] pinged self')
-        except Exception as e:
-            print(f'[keepalive] {e}')
-        time.sleep(10 * 60)
 
 # ── Announce page template ─────────────────────────────────────────────────────
 
@@ -1092,53 +931,44 @@ ANNOUNCE_HTML = r'''<!DOCTYPE html>
 <div class="card">
   <h1>📢 Post Announcement</h1>
   <p class="subtitle">Posts to all three CSIT 212 sections simultaneously</p>
-
   <div class="targets">
     <span class="tag">Section 212615</span>
     <span class="tag">Section 212604</span>
     <span class="tag">Section 216874</span>
   </div>
-
   <label>Announcement Title *</label>
   <input type="text" id="title" placeholder="e.g. Final Project Due Date Reminder">
-
   <label>Message *</label>
-  <textarea id="body" placeholder="Write your announcement here…&#10;&#10;HTML is supported, e.g. &lt;b&gt;bold&lt;/b&gt;, &lt;a href=&quot;...&quot;&gt;link&lt;/a&gt;"></textarea>
+  <textarea id="body" placeholder="Write your announcement here…"></textarea>
   <div class="hint">HTML is supported. Students will see this in Canvas under Announcements.</div>
-
   <div class="actions">
     <button class="btn btn-primary" id="submitBtn" onclick="postAnnouncement()">Post to All Sections</button>
     <button class="btn btn-clear" onclick="clearForm()">Clear</button>
   </div>
-
   <div class="results" id="results"></div>
 </div>
-
 <script>
 async function postAnnouncement() {
   const title = document.getElementById('title').value.trim();
   const body  = document.getElementById('body').value.trim();
   if (!title) { alert('Please enter a title.'); return; }
   if (!body)  { alert('Please write a message.'); return; }
-
   const btn = document.getElementById('submitBtn');
   btn.disabled = true; btn.textContent = 'Posting…';
-
   try {
     const res  = await fetch('/announce', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
+      method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({title, body})
     });
     const json = await res.json();
     const el   = document.getElementById('results');
     el.style.display = 'block';
     el.innerHTML = json.results.map(r => `
-      <div class="result-row ${r.ok ? 'ok' : 'fail'}">
-        <span class="icon">${r.ok ? '✅' : '❌'}</span>
+      <div class="result-row ${r.ok?'ok':'fail'}">
+        <span class="icon">${r.ok?'✅':'❌'}</span>
         <span class="result-label">${r.label}</span>
         <span class="result-info">${r.ok
-          ? '<a href="' + r.info + '" target="_blank">View in Canvas ↗</a>'
+          ? '<a href="'+r.info+'" target="_blank">View in Canvas ↗</a>'
           : r.info}</span>
       </div>`).join('');
     btn.textContent = json.ok ? '✓ Posted!' : 'Partial failure';
@@ -1148,7 +978,6 @@ async function postAnnouncement() {
     btn.disabled = false; btn.textContent = 'Post to All Sections';
   }
 }
-
 function clearForm() {
   document.getElementById('title').value = '';
   document.getElementById('body').value  = '';
@@ -1156,18 +985,17 @@ function clearForm() {
   document.getElementById('submitBtn').textContent = 'Post to All Sections';
   document.getElementById('submitBtn').disabled = false;
 }
-
 document.addEventListener('keydown', e => {
-  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') postAnnouncement();
+  if ((e.ctrlKey||e.metaKey) && e.key==='Enter') postAnnouncement();
 });
 </script>
 </body>
 </html>'''
 
-# Always init DB and start background threads (works with both gunicorn and direct run)
+# ── Startup ────────────────────────────────────────────────────────────────────
+
 init_db()
-threading.Thread(target=refresh_loop, daemon=True).start()
-threading.Thread(target=keep_alive,   daemon=True).start()
+threading.Thread(target=keep_alive, daemon=True).start()
 
 if __name__ == '__main__':
     print('\n  Canvas Final Project Server')
