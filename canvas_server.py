@@ -411,6 +411,48 @@ def post_comment():
 
     return jsonify({'ok': True, 'canvas_ok': canvas_ok})
 
+# ── Announcements ─────────────────────────────────────────────────────────────
+
+def canvas_post_announcement(course_id, title, message):
+    """Post an announcement to a Canvas course."""
+    url  = f'{CANVAS_BASE}/api/v1/courses/{course_id}/discussion_topics'
+    body = urllib.parse.urlencode({
+        'title':           title,
+        'message':         message,
+        'is_announcement': 'true',
+        'published':       'true',
+    }).encode()
+    req = urllib.request.Request(url, data=body, method='POST', headers={
+        'Authorization': 'Bearer ' + TOKEN,
+        'Accept':        'application/json',
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return True, json.loads(resp.read()).get('html_url', '')
+    except urllib.error.HTTPError as e:
+        return False, f'Canvas error {e.code}: {e.read().decode()}'
+    except Exception as e:
+        return False, str(e)
+
+@app.route('/announce')
+def announce_page():
+    return app.response_class(ANNOUNCE_HTML, mimetype='text/html')
+
+@app.route('/announce', methods=['POST'])
+def announce_post():
+    d     = request.get_json(force=True)
+    title = str(d.get('title', '')).strip()
+    body  = str(d.get('body',  '')).strip()
+    if not title or not body:
+        return jsonify({'ok': False, 'error': 'Title and body are required.'}), 400
+
+    results = []
+    for cfg in ASSIGNMENTS:
+        ok, info = canvas_post_announcement(cfg['course_id'], title, body)
+        results.append({'label': cfg['label'], 'ok': ok, 'info': info})
+    all_ok = all(r['ok'] for r in results)
+    return jsonify({'ok': all_ok, 'results': results})
+
 # ── HTML template ──────────────────────────────────────────────────────────────
 
 HTML = r'''<!DOCTYPE html>
@@ -999,6 +1041,128 @@ def keep_alive():
         except Exception as e:
             print(f'[keepalive] {e}')
         time.sleep(10 * 60)
+
+# ── Announce page template ─────────────────────────────────────────────────────
+
+ANNOUNCE_HTML = r'''<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Post Announcement – CSIT 212</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #f5f7fa; font-family: "Segoe UI", Arial, sans-serif; min-height: 100vh;
+    display: flex; align-items: flex-start; justify-content: center; padding: 48px 16px; }
+  .card { background: #fff; border-radius: 14px; box-shadow: 0 4px 24px rgba(0,0,0,0.1);
+    width: 100%; max-width: 640px; padding: 36px 40px; }
+  h1 { font-size: 1.35rem; font-weight: 800; color: #007acc; margin-bottom: 6px; }
+  .subtitle { font-size: 0.85rem; color: #999; margin-bottom: 28px; }
+  .targets { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 24px; }
+  .tag { background: #e8f4fd; color: #2b6cb0; border-radius: 20px; padding: 4px 12px;
+    font-size: 0.78rem; font-weight: 700; }
+  label { display: block; font-size: 0.78rem; font-weight: 700; color: #555;
+    text-transform: uppercase; letter-spacing: 0.07em; margin-bottom: 6px; margin-top: 20px; }
+  input, textarea { width: 100%; padding: 10px 14px; border: 1px solid #ddd; border-radius: 8px;
+    font-size: 0.95rem; font-family: inherit; outline: none; resize: vertical; color: #222; }
+  input:focus, textarea:focus { border-color: #007acc; box-shadow: 0 0 0 3px rgba(0,122,204,0.12); }
+  textarea { min-height: 160px; }
+  .hint { font-size: 0.75rem; color: #aaa; margin-top: 5px; }
+  .actions { margin-top: 28px; display: flex; gap: 12px; align-items: center; }
+  .btn { padding: 11px 28px; border: none; border-radius: 8px; font-size: 0.9rem;
+    font-weight: 700; cursor: pointer; transition: background 0.15s; }
+  .btn-primary { background: #007acc; color: #fff; }
+  .btn-primary:hover { background: #005fa3; }
+  .btn-primary:disabled { background: #a0c8e8; cursor: not-allowed; }
+  .btn-clear { background: #eee; color: #666; }
+  .btn-clear:hover { background: #ddd; }
+  .results { margin-top: 22px; border-radius: 10px; overflow: hidden; display: none; }
+  .result-row { display: flex; align-items: center; gap: 10px; padding: 11px 16px;
+    font-size: 0.875rem; border-bottom: 1px solid #f0f0f0; }
+  .result-row:last-child { border-bottom: none; }
+  .result-row.ok   { background: #f0fff4; }
+  .result-row.fail { background: #fff5f5; }
+  .icon { font-size: 1rem; }
+  .result-label { font-weight: 700; flex: 1; }
+  .result-info  { font-size: 0.78rem; color: #888; word-break: break-all; }
+  .result-info a { color: #007acc; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>📢 Post Announcement</h1>
+  <p class="subtitle">Posts to all three CSIT 212 sections simultaneously</p>
+
+  <div class="targets">
+    <span class="tag">Section 212615</span>
+    <span class="tag">Section 212604</span>
+    <span class="tag">Section 216874</span>
+  </div>
+
+  <label>Announcement Title *</label>
+  <input type="text" id="title" placeholder="e.g. Final Project Due Date Reminder">
+
+  <label>Message *</label>
+  <textarea id="body" placeholder="Write your announcement here…&#10;&#10;HTML is supported, e.g. &lt;b&gt;bold&lt;/b&gt;, &lt;a href=&quot;...&quot;&gt;link&lt;/a&gt;"></textarea>
+  <div class="hint">HTML is supported. Students will see this in Canvas under Announcements.</div>
+
+  <div class="actions">
+    <button class="btn btn-primary" id="submitBtn" onclick="postAnnouncement()">Post to All Sections</button>
+    <button class="btn btn-clear" onclick="clearForm()">Clear</button>
+  </div>
+
+  <div class="results" id="results"></div>
+</div>
+
+<script>
+async function postAnnouncement() {
+  const title = document.getElementById('title').value.trim();
+  const body  = document.getElementById('body').value.trim();
+  if (!title) { alert('Please enter a title.'); return; }
+  if (!body)  { alert('Please write a message.'); return; }
+
+  const btn = document.getElementById('submitBtn');
+  btn.disabled = true; btn.textContent = 'Posting…';
+
+  try {
+    const res  = await fetch('/announce', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({title, body})
+    });
+    const json = await res.json();
+    const el   = document.getElementById('results');
+    el.style.display = 'block';
+    el.innerHTML = json.results.map(r => `
+      <div class="result-row ${r.ok ? 'ok' : 'fail'}">
+        <span class="icon">${r.ok ? '✅' : '❌'}</span>
+        <span class="result-label">${r.label}</span>
+        <span class="result-info">${r.ok
+          ? '<a href="' + r.info + '" target="_blank">View in Canvas ↗</a>'
+          : r.info}</span>
+      </div>`).join('');
+    btn.textContent = json.ok ? '✓ Posted!' : 'Partial failure';
+    btn.disabled = false;
+  } catch(e) {
+    alert('Network error: ' + e.message);
+    btn.disabled = false; btn.textContent = 'Post to All Sections';
+  }
+}
+
+function clearForm() {
+  document.getElementById('title').value = '';
+  document.getElementById('body').value  = '';
+  document.getElementById('results').style.display = 'none';
+  document.getElementById('submitBtn').textContent = 'Post to All Sections';
+  document.getElementById('submitBtn').disabled = false;
+}
+
+document.addEventListener('keydown', e => {
+  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') postAnnouncement();
+});
+</script>
+</body>
+</html>'''
 
 # Always init DB and start background threads (works with both gunicorn and direct run)
 init_db()
