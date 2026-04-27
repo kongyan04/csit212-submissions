@@ -28,9 +28,9 @@ SMTP_PORT = 587
 SMTP_PASS = os.environ.get('MONTCLAIR_EMAIL_PASSWORD', 'QuFu1234!!')
 
 ASSIGNMENTS = [
-    {'label': 'Section 212615', 'course_id': '212615', 'assignment_id': '2606377'},
-    {'label': 'Section 212604', 'course_id': '212604', 'assignment_id': '2606374'},
-    {'label': 'Section 216874', 'course_id': '216874', 'assignment_id': '2624407'},
+    {'label': 'Section 212615', 'display_id': 'CSIT212_15SP26', 'course_id': '212615', 'assignment_id': '2606377'},
+    {'label': 'Section 212604', 'display_id': 'CSIT212_04SP26', 'course_id': '212604', 'assignment_id': '2606374'},
+    {'label': 'Section 216874', 'display_id': 'CSIT212_74SP26', 'course_id': '216874', 'assignment_id': '2624407'},
 ]
 
 SUPABASE_URL = 'https://gxcyitcuceimpsjpcdma.supabase.co'
@@ -459,7 +459,7 @@ HTML = r'''<!DOCTYPE html>
 </div>
 
 <script>
-const ASSIGNMENTS = ''' + json.dumps(ASSIGNMENTS) + r''';
+const ASSIGNMENTS = ''' + json.dumps([{**a} for a in ASSIGNMENTS]) + r''';
 let allSections = [];   // [{label,course_id,assignment_id,assign_name,due_at,rows}]
 let commentsMap = {};   // "cid|aid|sid" -> [comments]
 let ratingsMap  = {};   // "cid|aid|sid" -> {avg,count}
@@ -534,6 +534,7 @@ async function fetchSection(cfg) {
 
   return {
     label:         cfg.label,
+    display_id:    cfg.display_id || cfg.label,
     course_id:     cfg.course_id,
     assignment_id: cfg.assignment_id,
     assign_name:   asgn.name || '',
@@ -599,7 +600,7 @@ function renderSection(section) {
   div.id = id;
   div.innerHTML = `
     <div class="section-header">
-      <div class="section-title">${esc(section.label)} &nbsp;&ndash;&nbsp; ${esc(section.assign_name)}</div>
+      <div class="section-title">${esc(section.display_id||section.label)} &nbsp;&ndash;&nbsp; ${esc(section.assign_name)}</div>
       <div class="section-meta">${section.submitted} submitted &nbsp;/&nbsp; ${section.total} students${due?' &nbsp; '+due:''}</div>
     </div>
     <div class="toolbar">
@@ -932,14 +933,14 @@ ANNOUNCE_HTML = r'''<!DOCTYPE html>
   .result-info  { font-size: 0.78rem; color: #888; word-break: break-all; }
   .result-info a { color: #007acc; }
 
-  .section-checks { display: flex; flex-direction: column; gap: 8px; margin: 10px 0 4px; }
-  .check-label { display: flex; align-items: center; gap: 10px; padding: 10px 14px;
-    border: 1px solid #e2e8f0; border-radius: 8px; cursor: pointer; transition: background 0.1s; }
-  .check-label:hover { background: #f0f8ff; }
-  .check-label input[type=checkbox] { width: 16px; height: 16px; accent-color: #007acc; cursor: pointer; }
-  .check-info { display: flex; flex-direction: column; gap: 2px; }
-  .check-info strong { font-size: 0.9rem; color: #222; }
-  .cid { font-size: 0.75rem; color: #aaa; }
+  .section-checks { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0 4px; }
+  .check-label { display: flex; align-items: center; gap: 6px; padding: 6px 12px;
+    border: 1px solid #e2e8f0; border-radius: 20px; cursor: pointer;
+    transition: all 0.12s; font-size: 0.82rem; font-weight: 600; color: #444; background: #f7fafc; }
+  .check-label:hover { border-color: #007acc; background: #e8f4fd; color: #007acc; }
+  .check-label input[type=checkbox] { accent-color: #007acc; cursor: pointer; width: 13px; height: 13px; }
+  .check-label input[type=checkbox]:checked + span { color: #007acc; }
+  .cid { display: none; }
 </style>
 </head>
 <body>
@@ -949,18 +950,9 @@ ANNOUNCE_HTML = r'''<!DOCTYPE html>
 
   <label style="margin-top:0">Post to Sections *</label>
   <div class="section-checks">
-    <label class="check-label">
-      <input type="checkbox" name="section" value="212615" checked>
-      <span class="check-info"><strong>CSIT 212-615</strong> <span class="cid">Course ID: 212615</span></span>
-    </label>
-    <label class="check-label">
-      <input type="checkbox" name="section" value="212604" checked>
-      <span class="check-info"><strong>CSIT 212-604</strong> <span class="cid">Course ID: 212604</span></span>
-    </label>
-    <label class="check-label">
-      <input type="checkbox" name="section" value="216874" checked>
-      <span class="check-info"><strong>CSIT 212-874</strong> <span class="cid">Course ID: 216874</span></span>
-    </label>
+    <label class="check-label"><input type="checkbox" name="section" value="212615" checked><span>CSIT212_15SP26</span></label>
+    <label class="check-label"><input type="checkbox" name="section" value="212604" checked><span>CSIT212_04SP26</span></label>
+    <label class="check-label"><input type="checkbox" name="section" value="216874" checked><span>CSIT212_74SP26</span></label>
   </div>
 
   <label>Announcement Title *</label>
