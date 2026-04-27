@@ -15,6 +15,7 @@ import json
 import sqlite3
 import smtplib
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from flask import Flask, jsonify, request, abort
@@ -185,67 +186,70 @@ def send_email(to_addr, student_name, commenter_name, comment_body, project_url)
 
 # ── Data fetcher ───────────────────────────────────────────────────────────────
 
+def fetch_section(cfg):
+    """Fetch one assignment's submissions. Returns section dict."""
+    course_id, assignment_id = cfg['course_id'], cfg['assignment_id']
+    try:
+        assignment = canvas_get_all(f'/api/v1/courses/{course_id}/assignments/{assignment_id}')[0]
+        # include[]=user gives name/login/email directly — no separate users call needed
+        subs = canvas_get_all(
+            f'/api/v1/courses/{course_id}/assignments/{assignment_id}'
+            f'/submissions?per_page=100&include[]=user'
+        )
+        rows = []
+        for sub in subs:
+            student = sub.get('user') or {}
+            uid     = str(sub.get('user_id', ''))
+            links   = []
+            if sub.get('url'):
+                links.append(sub['url'])
+            for att in sub.get('attachments') or []:
+                if att.get('url'):
+                    links.append(att['url'])
+            login = student.get('login_id', '')
+            email = student.get('email', '') or (login + '@mail.montclair.edu' if login else '')
+            rows.append({
+                'student_id':      uid,
+                'name':            student.get('name', 'Unknown'),
+                'login':           login,
+                'email':           email,
+                'links':           links,
+                'submitted_at':    sub.get('submitted_at'),
+                'score':           sub.get('score'),
+                'points_possible': assignment.get('points_possible'),
+                'workflow_state':  sub.get('workflow_state'),
+                'late':            sub.get('late', False),
+                'missing':         sub.get('missing', False),
+            })
+        rows.sort(key=lambda r: (0 if r['submitted_at'] else 1, r['name'].lower()))
+        return {
+            'label':         cfg['label'],
+            'course_id':     course_id,
+            'assignment_id': assignment_id,
+            'assign_name':   assignment.get('name', ''),
+            'due_at':        assignment.get('due_at'),
+            'rows':          rows,
+            'submitted':     sum(1 for r in rows if r['submitted_at']),
+            'total':         len(rows),
+        }
+    except Exception as e:
+        return {
+            'label': cfg['label'], 'course_id': course_id,
+            'assignment_id': assignment_id, 'assign_name': '',
+            'due_at': None, 'rows': [], 'submitted': 0, 'total': 0,
+            'fetch_error': str(e),
+        }
+
 def fetch_all_data():
-    sections = []
-    for cfg in ASSIGNMENTS:
-        course_id, assignment_id = cfg['course_id'], cfg['assignment_id']
-        try:
-            assignment  = canvas_get_all(f'/api/v1/courses/{course_id}/assignments/{assignment_id}')[0]
-            students_raw = canvas_get_all(f'/api/v1/courses/{course_id}/users?enrollment_type[]=student&per_page=100')
-            student_map  = {str(s['id']): s for s in students_raw}
-            subs = canvas_get_all(f'/api/v1/courses/{course_id}/assignments/{assignment_id}/submissions?per_page=100&include[]=user')
-
-            rows = []
-            for sub in subs:
-                uid     = str(sub.get('user_id', ''))
-                student = student_map.get(uid) or sub.get('user') or {}
-                links   = []
-                if sub.get('url'):          links.append(sub['url'])
-                for att in sub.get('attachments') or []:
-                    if att.get('url'):      links.append(att['url'])
-
-                email = student.get('email', '') or (
-                    (student.get('login_id','') + '@mail.montclair.edu')
-                    if student.get('login_id') else ''
-                )
-
-                rows.append({
-                    'student_id':      uid,
-                    'name':            student.get('name', 'Unknown'),
-                    'login':           student.get('login_id', ''),
-                    'email':           email,
-                    'links':           links,
-                    'submitted_at':    sub.get('submitted_at'),
-                    'score':           sub.get('score'),
-                    'points_possible': assignment.get('points_possible'),
-                    'workflow_state':  sub.get('workflow_state'),
-                    'late':            sub.get('late', False),
-                    'missing':         sub.get('missing', False),
-                })
-
-            rows.sort(key=lambda r: (
-                0 if r['submitted_at'] else 1,
-                r['name'].lower()
-            ))
-
-            sections.append({
-                'label':       cfg['label'],
-                'course_id':   course_id,
-                'assignment_id': assignment_id,
-                'assign_name': assignment.get('name', ''),
-                'due_at':      assignment.get('due_at'),
-                'rows':        rows,
-                'submitted':   sum(1 for r in rows if r['submitted_at']),
-                'total':       len(rows),
-            })
-        except Exception as e:
-            sections.append({
-                'label': cfg['label'], 'course_id': course_id,
-                'assignment_id': assignment_id, 'assign_name': '',
-                'due_at': None, 'rows': [], 'submitted': 0, 'total': 0,
-                'fetch_error': str(e),
-            })
-    return sections
+    """Fetch all sections in parallel."""
+    sections_map = {}
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        futures = {ex.submit(fetch_section, cfg): cfg['label'] for cfg in ASSIGNMENTS}
+        for fut in as_completed(futures):
+            label = futures[fut]
+            sections_map[label] = fut.result()
+    # Return in original order
+    return [sections_map[cfg['label']] for cfg in ASSIGNMENTS]
 
 def do_fetch():
     """Fetch once, update cache, then schedule next fetch."""
