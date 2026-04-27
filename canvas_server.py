@@ -989,9 +989,21 @@ loadData();
 </html>'''
 
 
-# Always init DB and start background thread (works with both gunicorn and direct run)
+def keep_alive():
+    """Ping self every 10 minutes so Render free tier never sleeps."""
+    time.sleep(60)  # wait for server to fully start first
+    while True:
+        try:
+            urllib.request.urlopen('https://csit212-submissions.onrender.com/data', timeout=15)
+            print('[keepalive] pinged self')
+        except Exception as e:
+            print(f'[keepalive] {e}')
+        time.sleep(10 * 60)
+
+# Always init DB and start background threads (works with both gunicorn and direct run)
 init_db()
 threading.Thread(target=refresh_loop, daemon=True).start()
+threading.Thread(target=keep_alive,   daemon=True).start()
 
 if __name__ == '__main__':
     print('\n  Canvas Final Project Server')
