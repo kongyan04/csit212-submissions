@@ -38,7 +38,7 @@ ASSIGNMENTS = [
     {'label': 'Section 216874', 'course_id': '216874', 'assignment_id': '2624407'},
 ]
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'comments.db')
+DB_PATH = os.environ.get('DB_PATH', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'comments.db'))
 
 # ── Shared cache ───────────────────────────────────────────────────────────────
 cache = {'sections': [], 'last_updated': None, 'loading': False, 'error': None}
@@ -60,8 +60,36 @@ def init_db():
         body         TEXT NOT NULL,
         created_at   TEXT NOT NULL
     )''')
+    con.execute('''CREATE TABLE IF NOT EXISTS ratings (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        course_id     TEXT NOT NULL,
+        assignment_id TEXT NOT NULL,
+        student_id    TEXT NOT NULL,
+        score         INTEGER NOT NULL CHECK(score BETWEEN 1 AND 10),
+        created_at    TEXT NOT NULL
+    )''')
     con.commit()
     con.close()
+
+def db_add_rating(course_id, assignment_id, student_id, score):
+    con = sqlite3.connect(DB_PATH)
+    con.execute(
+        'INSERT INTO ratings (course_id, assignment_id, student_id, score, created_at) VALUES (?,?,?,?,?)',
+        (course_id, assignment_id, student_id, score,
+         time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()))
+    )
+    con.commit()
+    con.close()
+
+def db_all_ratings():
+    """Return dict keyed by (course_id, assignment_id, student_id) → {avg, count}."""
+    con = sqlite3.connect(DB_PATH)
+    rows = con.execute(
+        'SELECT course_id, assignment_id, student_id, AVG(score) as avg, COUNT(*) as cnt '
+        'FROM ratings GROUP BY course_id, assignment_id, student_id'
+    ).fetchall()
+    con.close()
+    return {(r[0], r[1], r[2]): {'avg': round(r[3], 1), 'count': r[4]} for r in rows}
 
 def db_add_comment(course_id, assignment_id, student_id, author_name, author_email, body):
     con = sqlite3.connect(DB_PATH)
@@ -204,8 +232,10 @@ def fetch_section(cfg):
             if sub.get('url'):
                 links.append(sub['url'])
             for att in sub.get('attachments') or []:
-                if att.get('url'):
-                    links.append(att['url'])
+                url = att.get('url', '')
+                # Skip Canvas file-download URLs — only keep external website links
+                if url and 'instructure.com' not in url:
+                    links.append(url)
             login = student.get('login_id', '')
             email = student.get('email', '') or (login + '@mail.montclair.edu' if login else '')
             rows.append({
@@ -295,12 +325,14 @@ def data():
     trigger_fetch_if_needed()  # wake up if the background thread was killed during sleep
     with cache_lock:
         sections = json.loads(json.dumps(cache['sections']))  # deep copy
-    # Attach comments
+    # Attach comments and ratings
     all_comments = db_all_comments()
+    all_ratings  = db_all_ratings()
     for sec in sections:
         for row in sec.get('rows', []):
             key = (sec['course_id'], sec['assignment_id'], str(row['student_id']))
             row['comments'] = all_comments.get(key, [])
+            row['rating']   = all_ratings.get(key, {'avg': None, 'count': 0})
     with cache_lock:
         return jsonify({
             'sections':     sections,
@@ -308,6 +340,30 @@ def data():
             'loading':      cache['loading'],
             'error':        cache['error'],
         })
+
+@app.route('/rate', methods=['POST'])
+def post_rating():
+    d = request.get_json(force=True)
+    course_id     = str(d.get('course_id', '')).strip()
+    assignment_id = str(d.get('assignment_id', '')).strip()
+    student_id    = str(d.get('student_id', '')).strip()
+    score         = d.get('score')
+
+    if not all([course_id, assignment_id, student_id]):
+        return jsonify({'ok': False, 'error': 'Missing fields'}), 400
+    try:
+        score = int(score)
+        assert 1 <= score <= 10
+    except Exception:
+        return jsonify({'ok': False, 'error': 'Score must be 1–10'}), 400
+
+    known = {(a['course_id'], a['assignment_id']) for a in ASSIGNMENTS}
+    if (course_id, assignment_id) not in known:
+        return jsonify({'ok': False, 'error': 'Unknown assignment'}), 403
+
+    db_add_rating(course_id, assignment_id, student_id, score)
+    rating = db_all_ratings().get((course_id, assignment_id, student_id), {'avg': score, 'count': 1})
+    return jsonify({'ok': True, 'rating': rating})
 
 @app.route('/comment', methods=['POST'])
 def post_comment():
@@ -469,6 +525,21 @@ HTML = r'''<!DOCTYPE html>
   .modal-success { color: #276749; font-size: 0.82rem; margin-top: 10px; background: #c6f6d5;
     border-radius: 6px; padding: 8px 12px; }
 
+  /* Rating */
+  .rating-cell { min-width: 120px; }
+  .rate-btn { background: none; border: 1px dashed #f6ad55; color: #c07a00;
+    border-radius: 6px; padding: 4px 10px; font-size: 0.78rem; cursor: pointer;
+    transition: all 0.15s; white-space: nowrap; margin-top: 5px; display: inline-block; }
+  .rate-btn:hover { background: #f6ad55; color: #fff; }
+
+  /* Rating modal stars */
+  .rating-stars-row { display: flex; gap: 6px; justify-content: center; flex-wrap: wrap; margin: 18px 0 8px; }
+  .rstar { width: 38px; height: 38px; border-radius: 8px; border: 2px solid #e2e8f0;
+    background: #f7fafc; font-size: 1rem; font-weight: 700; color: #555; cursor: pointer;
+    transition: all 0.12s; display: flex; align-items: center; justify-content: center; }
+  .rstar:hover, .rstar.active { background: #f6ad55; border-color: #f6ad55; color: #fff; }
+  .rstar.selected { background: #007acc; border-color: #007acc; color: #fff; }
+
   .empty-state { text-align: center; padding: 48px 20px; color: #bbb; font-size: 0.9rem; }
   .loading-state { text-align: center; padding: 60px 20px; color: #999; }
   .spinner { width: 36px; height: 36px; border: 4px solid #e2e8f0; border-top-color: #007acc;
@@ -513,10 +584,27 @@ HTML = r'''<!DOCTYPE html>
   </div>
 </div>
 
+<!-- Rating Modal -->
+<div class="modal-backdrop" id="ratingBackdrop" onclick="closeRatingModal(event)">
+  <div class="modal" style="max-width:400px;text-align:center">
+    <h3>Rate this Project</h3>
+    <div class="target-name" id="ratingTargetName"></div>
+    <div class="rating-stars-row" id="ratingStarsRow"></div>
+    <div style="font-size:0.82rem;color:#aaa;margin-bottom:4px">Click a number to select your rating</div>
+    <div class="modal-error"   id="ratingError"   style="display:none;text-align:left"></div>
+    <div class="modal-success" id="ratingSuccess" style="display:none;text-align:left"></div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="closeRatingModal()">Cancel</button>
+      <button class="btn btn-primary" id="ratingSubmitBtn" onclick="submitRating()">Submit Rating</button>
+    </div>
+  </div>
+</div>
+
 <script>
 let allData   = null;
 let sortState = {};
 let modalCtx  = null;   // { courseId, assignmentId, studentId, studentName }
+let ratingCtx = null;   // { courseId, assignmentId, studentId, studentName, score }
 
 // ── Data loading ──────────────────────────────────────────────────────────────
 
@@ -612,9 +700,8 @@ function renderSection(section) {
       <thead><tr>
         <th onclick="sortSec('${id}','${section.label}',0)">Student <span class="si">↕</span></th>
         <th>Submission Link</th>
-        <th onclick="sortSec('${id}','${section.label}',2)">Submitted <span class="si">↕</span></th>
-        <th onclick="sortSec('${id}','${section.label}',3)">Score <span class="si">↕</span></th>
         <th>Status</th>
+        <th>Rating</th>
         <th>Comments</th>
       </tr></thead>
       <tbody id="tbody-${id}"></tbody>
@@ -674,7 +761,7 @@ function doSort(rows, col, asc) {
 function renderRows(tbodyId, rows, section) {
   const tbody = document.getElementById(tbodyId); if (!tbody) return;
   if (!rows.length) {
-    tbody.innerHTML = '<tr><td colspan="6"><div class="empty-state">No students match.</div></td></tr>'; return;
+    tbody.innerHTML = '<tr><td colspan="5"><div class="empty-state">No students match.</div></td></tr>'; return;
   }
   tbody.innerHTML = rows.map(r => {
     const linkHtml = r.links.length
@@ -705,12 +792,20 @@ function renderRows(tbodyId, rows, section) {
       ? `💬 ${comments.length} comment${comments.length>1?'s':''}`
       : '+ Add comment';
 
+    const rating = r.rating || {avg: null, count: 0};
+    const ratingCid = 'rc-' + esc(section.course_id) + '-' + esc(r.student_id);
+    const avgStr = rating.avg != null
+      ? `<span style="font-size:1.1rem;font-weight:800;color:#007acc">${rating.avg}</span><span style="font-size:0.75rem;color:#aaa">/10</span> <span style="font-size:0.72rem;color:#bbb">(${rating.count} vote${rating.count!==1?'s':''})</span>`
+      : '<span style="color:#ccc;font-size:0.8rem">No ratings yet</span>';
+
     return `<tr>
       <td><div class="student-name">${esc(r.name)}</div><div class="student-login">${esc(r.login)}</div></td>
       <td class="link-cell">${linkHtml}</td>
-      <td class="date-cell">${dateStr}</td>
-      <td class="score-cell">${scoreStr}</td>
       <td>${pill}</td>
+      <td class="rating-cell">
+        <div id="${ratingCid}">${avgStr}</div>
+        <button class="rate-btn" onclick="openRatingModal('${esc(section.course_id)}','${esc(section.assignment_id)}','${esc(r.student_id)}','${esc(r.name)}','${ratingCid}')">⭐ Rate</button>
+      </td>
       <td class="comment-cell">
         <div class="comment-list">${commentHtml}</div>
         <button class="add-comment-btn" onclick="openModal('${esc(section.course_id)}','${esc(section.assignment_id)}','${esc(r.student_id)}','${esc(r.name)}')">${btnLabel}</button>
@@ -788,9 +883,93 @@ async function submitComment() {
   }
 }
 
-// Close modal on Escape
+// ── Rating Modal ──────────────────────────────────────────────────────────────
+
+function openRatingModal(courseId, assignmentId, studentId, studentName, cid) {
+  ratingCtx = { courseId, assignmentId, studentId, studentName, cid, score: null };
+  document.getElementById('ratingTargetName').textContent = studentName + "'s project";
+  document.getElementById('ratingError').style.display   = 'none';
+  document.getElementById('ratingSuccess').style.display = 'none';
+  document.getElementById('ratingSubmitBtn').disabled    = false;
+  document.getElementById('ratingSubmitBtn').textContent = 'Submit Rating';
+
+  // Build number buttons 1–10
+  const row = document.getElementById('ratingStarsRow');
+  row.innerHTML = [1,2,3,4,5,6,7,8,9,10].map(n =>
+    `<button class="rstar" id="rstar${n}" onclick="selectStar(${n})">${n}</button>`
+  ).join('');
+
+  document.getElementById('ratingBackdrop').classList.add('open');
+}
+
+function selectStar(n) {
+  if (!ratingCtx) return;
+  ratingCtx.score = n;
+  for (let i = 1; i <= 10; i++) {
+    const el = document.getElementById('rstar' + i);
+    if (el) el.classList.toggle('selected', i <= n);
+  }
+}
+
+function closeRatingModal(e) {
+  if (e && e.target !== document.getElementById('ratingBackdrop')) return;
+  document.getElementById('ratingBackdrop').classList.remove('open');
+}
+
+async function submitRating() {
+  if (!ratingCtx) return;
+  const errEl = document.getElementById('ratingError');
+  const okEl  = document.getElementById('ratingSuccess');
+  errEl.style.display = 'none';
+  okEl.style.display  = 'none';
+
+  if (!ratingCtx.score) {
+    errEl.textContent = 'Please select a rating first.';
+    errEl.style.display = 'block'; return;
+  }
+
+  const btn = document.getElementById('ratingSubmitBtn');
+  btn.disabled = true; btn.textContent = 'Submitting…';
+
+  try {
+    const res  = await fetch('/rate', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        course_id: ratingCtx.courseId, assignment_id: ratingCtx.assignmentId,
+        student_id: ratingCtx.studentId, score: ratingCtx.score
+      })
+    });
+    const json = await res.json();
+    if (json.ok) {
+      const r = json.rating;
+      const avgEl = document.getElementById(ratingCtx.cid);
+      if (avgEl) avgEl.innerHTML =
+        `<span style="font-size:1.1rem;font-weight:800;color:#007acc">${r.avg}</span>`+
+        `<span style="font-size:0.75rem;color:#aaa">/10</span> `+
+        `<span style="font-size:0.72rem;color:#bbb">(${r.count} vote${r.count!==1?'s':''})</span>`;
+      okEl.textContent = `✓ You rated this ${ratingCtx.score}/10. Thanks!`;
+      okEl.style.display = 'block';
+      btn.textContent = 'Submitted!';
+      setTimeout(() => document.getElementById('ratingBackdrop').classList.remove('open'), 1400);
+    } else {
+      errEl.textContent = json.error || 'Failed to submit.';
+      errEl.style.display = 'block';
+      btn.disabled = false; btn.textContent = 'Submit Rating';
+    }
+  } catch(e) {
+    errEl.textContent = 'Network error — please try again.';
+    errEl.style.display = 'block';
+    btn.disabled = false; btn.textContent = 'Submit Rating';
+  }
+}
+
+// Close modals on Escape
 document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') document.getElementById('modalBackdrop').classList.remove('open');
+  if (e.key === 'Escape') {
+    document.getElementById('modalBackdrop').classList.remove('open');
+    document.getElementById('ratingBackdrop').classList.remove('open');
+  }
 });
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
