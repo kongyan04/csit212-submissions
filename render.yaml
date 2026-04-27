@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: csit212-submissions
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn canvas_server:app
+    envVars:
+      - key: MONTCLAIR_EMAIL_PASSWORD
+        value: QuFu1234!!
