@@ -247,23 +247,38 @@ def fetch_all_data():
             })
     return sections
 
-def refresh_loop():
-    while True:
-        print('[canvas] Fetching data from Canvas…')
+def do_fetch():
+    """Fetch once, update cache, then schedule next fetch."""
+    print('[canvas] Fetching data from Canvas…')
+    with cache_lock:
+        cache['loading'] = True; cache['error'] = None
+    try:
+        sections = fetch_all_data()
         with cache_lock:
-            cache['loading'] = True; cache['error'] = None
-        try:
-            sections = fetch_all_data()
-            with cache_lock:
-                cache['sections']     = sections
-                cache['last_updated'] = time.strftime('%B %d, %Y at %I:%M %p')
-                cache['loading']      = False
-            print(f'[canvas] Done — {sum(s["total"] for s in sections)} submissions loaded.')
-        except Exception as e:
-            with cache_lock:
-                cache['error'] = str(e); cache['loading'] = False
-            print(f'[canvas] Error: {e}')
-        time.sleep(REFRESH_INTERVAL)
+            cache['sections']     = sections
+            cache['last_updated'] = time.strftime('%B %d, %Y at %I:%M %p')
+            cache['loading']      = False
+        print(f'[canvas] Done — {sum(s["total"] for s in sections)} submissions loaded.')
+    except Exception as e:
+        with cache_lock:
+            cache['error'] = str(e); cache['loading'] = False
+        print(f'[canvas] Error: {e}')
+    # Schedule next fetch
+    t = threading.Timer(REFRESH_INTERVAL, do_fetch)
+    t.daemon = True
+    t.start()
+
+def trigger_fetch_if_needed():
+    """Start a fetch if cache is empty and not already loading."""
+    with cache_lock:
+        if cache['sections'] or cache['loading']:
+            return
+        cache['loading'] = True
+    print('[canvas] On-demand fetch triggered.')
+    threading.Thread(target=do_fetch, daemon=True).start()
+
+def refresh_loop():
+    do_fetch()
 
 # ── Flask routes ───────────────────────────────────────────────────────────────
 
@@ -273,6 +288,7 @@ def index():
 
 @app.route('/data')
 def data():
+    trigger_fetch_if_needed()  # wake up if the background thread was killed during sleep
     with cache_lock:
         sections = json.loads(json.dumps(cache['sections']))  # deep copy
     # Attach comments
@@ -502,27 +518,32 @@ let modalCtx  = null;   // { courseId, assignmentId, studentId, studentName }
 
 async function loadData() {
   try {
-    console.log('1. fetching /data...');
     const res  = await fetch('/data');
-    console.log('2. got response, status:', res.status);
     const json = await res.json();
-    console.log('3. parsed json, sections:', json.sections.length, 'loading:', json.loading);
+
+    if (json.loading && !json.sections.length) {
+      // Server is still fetching from Canvas — show spinner and poll again
+      document.getElementById('statusDot').className = 'dot loading';
+      document.getElementById('statusText').textContent = 'Loading submissions from Canvas…';
+      document.getElementById('main').innerHTML =
+        '<div class="loading-state"><div class="spinner"></div>Fetching submissions from Canvas, please wait…</div>';
+      setTimeout(loadData, 5000);
+      return;
+    }
+
     document.getElementById('statusDot').className = 'dot';
     document.getElementById('statusText').textContent = 'Live';
     document.getElementById('lastUpdated').textContent =
       json.last_updated ? 'Updated ' + json.last_updated : '';
     allData = json.sections;
-    console.log('4. calling renderAll...');
     renderAll();
-    console.log('5. renderAll done');
     clearTimeout(window._refreshTimer);
     window._refreshTimer = setTimeout(loadData, 30 * 60 * 1000);
     startCountdown(30 * 60);
   } catch(e) {
-    console.error('loadData error:', e);
     document.getElementById('statusText').textContent = 'Error: ' + e.message;
     document.getElementById('statusDot').className = 'dot loading';
-    setTimeout(loadData, 30000);
+    setTimeout(loadData, 15000);
   }
 }
 
