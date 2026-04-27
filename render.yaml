@@ -7,3 +7,5 @@ services:
     envVars:
       - key: MONTCLAIR_EMAIL_PASSWORD
         value: QuFu1234!!
+      - key: PYTHON_VERSION
+        value: 3.11.0
