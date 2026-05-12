@@ -103,9 +103,13 @@ def db_all_ratings():
 
 # ── Canvas helpers ─────────────────────────────────────────────────────────────
 
-def canvas_request(method, path, body=None):
-    url = CANVAS_BASE + path
-    headers = {'Authorization': 'Bearer ' + TOKEN, 'Accept': 'application/json'}
+def canvas_request(method, path, body=None, user_token=None, user_base=None, content_type=None):
+    base = user_base or CANVAS_BASE
+    url = base + path
+    token = user_token or TOKEN
+    headers = {'Authorization': 'Bearer ' + token, 'Accept': 'application/json'}
+    if content_type:
+        headers['Content-Type'] = content_type
     req = urllib.request.Request(url, data=body, method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:
@@ -171,17 +175,42 @@ def send_email(to_addr, student_name, commenter_name, comment_body, project_url)
 def index():
     return app.response_class(HTML, mimetype='text/html')
 
-@app.route('/canvas-proxy/<path:canvas_path>')
+@app.route('/canvas-proxy/<path:canvas_path>', methods=['GET', 'PUT', 'POST', 'DELETE', 'OPTIONS'])
 def canvas_proxy(canvas_path):
-    """Forward GET requests to Canvas with server-side auth token."""
-    qs   = request.query_string.decode()
-    path = '/' + canvas_path + ('?' + qs if qs else '')
-    code, body, link = canvas_request('GET', path)
-    # Rewrite pagination links to go through proxy
+    """Forward requests to Canvas with server-side or user-supplied auth token.
+
+    User can supply their own credentials via headers:
+      X-Canvas-Token   — their Canvas API token (used instead of server default)
+      X-Canvas-Domain  — their Canvas instance, e.g. https://harvard.instructure.com
+    """
+    # Handle CORS preflight
+    if request.method == 'OPTIONS':
+        resp = Response('', status=204)
+        resp.headers['Access-Control-Allow-Origin'] = '*'
+        resp.headers['Access-Control-Allow-Methods'] = 'GET, PUT, POST, DELETE, OPTIONS'
+        resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-Canvas-Token, X-Canvas-Domain'
+        return resp
+
+    qs       = request.query_string.decode()
+    path     = '/' + canvas_path + ('?' + qs if qs else '')
+    req_body = request.get_data() if request.method in ('PUT', 'POST') else None
+    user_token  = request.headers.get('X-Canvas-Token')
+    user_domain = request.headers.get('X-Canvas-Domain')
+    ct          = request.headers.get('Content-Type')
+
+    code, body, link = canvas_request(
+        request.method, path, req_body,
+        user_token=user_token, user_base=user_domain, content_type=ct
+    )
+
+    base_for_rewrite = user_domain or CANVAS_BASE
     if link:
-        link = link.replace(CANVAS_BASE, request.host_url.rstrip('/') + '/canvas-proxy')
+        link = link.replace(base_for_rewrite, request.host_url.rstrip('/') + '/canvas-proxy')
+
     resp = Response(body, status=code, mimetype='application/json')
     resp.headers['Access-Control-Allow-Origin'] = '*'
+    resp.headers['Access-Control-Allow-Methods'] = 'GET, PUT, POST, DELETE, OPTIONS'
+    resp.headers['Access-Control-Expose-Headers'] = 'Link'
     if link:
         resp.headers['Link'] = link
     return resp
@@ -262,6 +291,55 @@ def announce_post():
         ok, info = canvas_post_announcement(cfg['course_id'], title, body)
         results.append({'label': cfg['label'], 'ok': ok, 'info': info})
     return jsonify({'ok': all(r['ok'] for r in results), 'results': results})
+
+# ── Banner Grade Submission ────────────────────────────────────────────────────
+
+@app.route('/submit-banner-grades', methods=['POST', 'OPTIONS'])
+def submit_banner_grades():
+    """Accept grade data and store for Banner submission."""
+    if request.method == 'OPTIONS':
+        resp = Response('', status=204)
+        resp.headers['Access-Control-Allow-Origin'] = '*'
+        resp.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
+        resp.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+        return resp
+
+    d = request.get_json(force=True)
+    course_id = d.get('course_id', '')
+    crn       = d.get('crn', '')
+    term      = d.get('term', '202620')
+    grades    = d.get('grades', [])
+
+    if not grades:
+        return jsonify({'ok': False, 'error': 'No grades provided.'}), 400
+
+    # Store grades to a JSON file for the Playwright script to pick up
+    import os
+    grade_file = os.path.join(os.path.dirname(__file__), f'pending_grades_{course_id}.json')
+    with open(grade_file, 'w') as f:
+        json.dump({'course_id': course_id, 'crn': crn, 'term': term, 'grades': grades,
+                   'submitted_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}, f, indent=2)
+
+    # Also store in Supabase for persistence
+    try:
+        _sb_insert('final_grades', {
+            'course_id': course_id, 'crn': crn, 'term': term,
+            'grades': json.dumps(grades),
+            'created_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+        })
+    except:
+        pass  # Supabase is optional
+
+    resp = jsonify({
+        'ok': True,
+        'message': f'Saved {len(grades)} grades for CRN {crn}. '
+                   f'Run "python3 nest_scraper.py submit-grades {course_id}" to push to Banner, '
+                   f'or use the exported CSV to enter grades manually in Banner SSB.',
+        'file': grade_file,
+        'count': len(grades),
+    })
+    resp.headers['Access-Control-Allow-Origin'] = '*'
+    return resp
 
 # ── Keep-alive (prevent Render free tier sleep) ────────────────────────────────
 
